@@ -215,6 +215,7 @@ Moegliche Intents:
 - query_events: Termine und Aufgaben abfragen
 - delete_event: Termin loeschen
 - general: Allgemeine Frage oder Konversation
+- send_briefing: Morgen-Briefing jetzt senden (wenn jemand "briefing", "morgen-briefing", "was steht an" sagt)
 
 Entscheide so:
 - Hat eine Uhrzeit → create_event
@@ -399,6 +400,8 @@ def execute_intent(intent_data, user_id, context_data):
         events = get_upcoming_events(14)
         return "Hier sind eure naechsten Termine und Aufgaben:\n" + events, None
     
+    elif intent == "send_briefing":
+        return "SEND_BRIEFING", None
     else:
         return None, None
 
