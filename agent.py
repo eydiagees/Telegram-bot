@@ -150,10 +150,11 @@ def get_upcoming_events(days=7):
     except Exception as e:
         return f"Fehler: {e}"
 
-def process_calendar(response):
+def process_calendar(response,data=None):
     if "KALENDER_TERMIN:" not in response:
-        return response
+        return response,None
     results=[]
+    pending=None
     lines=response.strip().split("\n")
     for line in lines:
         line=line.strip()
@@ -179,6 +180,7 @@ def process_calendar(response):
                     msg+="\nFreie Slots: "+", ".join(free)
                 msg+="\nTrotzdem eintragen? Antworte mit JA."
                 results.append(msg)
+                pending={"title":title,"dt":dt.isoformat().split("+")[0]}
             else:
                 ok=add_calendar_event(title,dt,end_dt)
                 if ok:
@@ -188,8 +190,8 @@ def process_calendar(response):
         except Exception as e:
             results.append("Fehler: "+str(e))
     if results:
-        return "\n".join(results)
-    return response
+        return "\n".join(results),pending
+    return response,None
 
 async def ask_gpt(user_message,user_id,context_data):
     tz=pytz.timezone(TIMEZONE)
@@ -282,9 +284,9 @@ async def handle_text(update,context):
         dt_match=data.get("last_event_dt",None)
         if title_match and dt_match:
             data["pending_event"]={"title":title_match.group(1),"dt":dt_match}
-    response=process_calendar(response)
-    if "pending_event" not in data and "KALENDER_TERMIN:" in response:
-        pass
+    response,pending=process_calendar(response,data)
+    if pending:
+        data["pending_event"]=pending
     data["conversation"].append({"role":"user","content":text})
     data["conversation"].append({"role":"assistant","content":response})
     if len(data["conversation"])>20:
@@ -309,7 +311,9 @@ async def handle_voice(update,context):
     user_name=USER_NAMES.get(user_id,"")
     await update.message.reply_text("Gehoert: "+(user_name+": " if user_name else "")+text)
     response=await ask_gpt(text,user_id,data)
-    response=process_calendar(response)
+    response,pending=process_calendar(response,data)
+    if pending:
+        data["pending_event"]=pending
     data["conversation"].append({"role":"user","content":text})
     data["conversation"].append({"role":"assistant","content":response})
     if len(data["conversation"])>20:
