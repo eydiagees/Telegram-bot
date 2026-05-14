@@ -590,11 +590,115 @@ async def start(update,context):
         "Schreib mir oder schick eine Sprachnachricht!"
     )
 
+
+# ── Morgen-Briefing ───────────────────────────────────────────────────────────
+async def generate_briefing(bot):
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz)
+    weekdays_de = ["Montag","Dienstag","Mittwoch","Donnerstag","Freitag","Samstag","Sonntag"]
+    weekday = weekdays_de[now.weekday()]
+    
+    events = get_upcoming_events(2)
+    memory_ctx = get_memory_context()
+    
+    prompt = (
+        "Du bist ein persoenlicher Assistent fuer ein Paar mit ADHS. "
+        "Erstelle ein kurzes, freundliches Morgen-Briefing auf Deutsch. "
+        "Heute ist " + weekday + " " + now.strftime("%d.%m.%Y") + ".\n"
+        "Termine heute und morgen:\n" + events + "\n"
+        + memory_ctx +
+        "\nDas Briefing soll:\n"
+        "- Mit Guten Morgen beginnen\n"
+        "- Heutigen Tag und Datum nennen\n"
+        "- Wichtige Termine heute erwaehnen\n"
+        "- An offene Aufgaben erinnern\n"
+        "- Morgen kurz vorausschauen\n"
+        "- Max 8 Zeilen, klar und strukturiert\n"
+        "- Emojis sparsam nutzen\n"
+        "Kein langer Text - kurz und praktisch!"
+    )
+    
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role":"user","content":prompt}],
+        max_tokens=300
+    )
+    
+    briefing = response.choices[0].message.content
+    
+    # Send to group - use the chat IDs from ALLOWED_USERS
+    for user_id in ALLOWED_USERS:
+        if user_id.strip():
+            try:
+                await bot.send_message(chat_id=int(user_id.strip()), text=briefing)
+                break  # Send once to first user, they are in same group
+            except:
+                pass
+
+async def evening_checkin(bot):
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz)
+    
+    # Get todays calendar events
+    service = get_calendar_service()
+    if not service:
+        return
+    
+    day_start = tz.localize(datetime(now.year,now.month,now.day,0,0))
+    day_end = tz.localize(datetime(now.year,now.month,now.day,23,59))
+    
+    result = service.events().list(
+        calendarId=CALENDAR_ID,
+        timeMin=day_start.isoformat(),
+        timeMax=day_end.isoformat(),
+        singleEvents=True,
+        orderBy="startTime"
+    ).execute()
+    
+    events = result.get("items",[])
+    tasks = [e for e in events if e.get("summary","").startswith("✅")]
+    
+    if not tasks:
+        return
+    
+    msg = "Guten Abend! 🌙 Kurzes Check-in:\n\n"
+    for i, t in enumerate(tasks, 1):
+        msg += f"{i}. {t.get('summary','').replace('✅ ','')}\n"
+    msg += "\nWas habt ihr heute erledigt? Antwortet mit den Nummern z.B. '1,3' oder 'alles' oder 'nichts'"
+    
+    for user_id in ALLOWED_USERS:
+        if user_id.strip():
+            try:
+                await bot.send_message(chat_id=int(user_id.strip()), text=msg)
+                break
+            except:
+                pass
+
+async def scheduler(bot):
+    import asyncio
+    tz = pytz.timezone(TIMEZONE)
+    while True:
+        now = datetime.now(tz)
+        # Morning briefing at 8:00
+        if now.hour == 7 and now.minute == 0:
+            await generate_briefing(bot)
+            await asyncio.sleep(61)
+        # Evening check-in at 20:00
+        elif now.hour == 20 and now.minute == 0:
+            await evening_checkin(bot)
+            await asyncio.sleep(61)
+        else:
+            await asyncio.sleep(30)
+
 def main():
     app=ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",start))
     app.add_handler(MessageHandler(filters.VOICE,handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_text))
+    import asyncio
+    async def post_init(application):
+        asyncio.create_task(scheduler(application.bot))
+    app.post_init = post_init
     print("Agent laeuft!")
     app.run_polling()
 
