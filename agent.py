@@ -572,16 +572,13 @@ async def handle_voice(update,context):
     with tempfile.NamedTemporaryFile(suffix=".ogg",delete=False) as tmp:
         tmp_path=tmp.name
     await voice_file.download_to_drive(tmp_path)
-    text=await transcribe_voice(tmp_path)
+   text=await transcribe_voice(tmp_path)
         os.unlink(tmp_path)
         briefing_keywords = ["tagesplan","briefing","was steht an","mein tag","morning briefing"]
         if any(kw in text.lower() for kw in briefing_keywords):
             await generate_briefing(context.bot, target_user_id=user_id)
             return
-    if any(kw in text.lower() for kw in briefing_keywords):
-        await generate_briefing(context.bot, target_user_id=user_id)
-        return
-    os.unlink(tmp_path)
+        user_name=USER_NAMES.get(user_id,"")
     user_name=USER_NAMES.get(user_id,"")
     await update.message.reply_text("Gehoert: "+(user_name+": " if user_name else "")+text)
     intent_data = detect_intent(text, user_id, data)
