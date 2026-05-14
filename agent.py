@@ -271,7 +271,7 @@ async def handle_text(update,context):
                     return
             except:
                 pass
-        elif txt in ["NEIN","NO","CANCEL","ABBRECHEN"]:
+        elif any(txt==w or txt.startswith(w) for w in nein_words):
             del data["pending_event"]
             save_data(data)
             await update.message.reply_text("OK, Termin nicht eingetragen.")
