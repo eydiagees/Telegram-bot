@@ -194,6 +194,170 @@ def process_calendar(response,data=None):
         return "\n".join(results),pending
     return response,None
 
+
+USERS = {
+    "281391093": {"name":"Karsten","lang":"de","partner_id":"934428072"},
+    "934428072": {"name":"Kate","lang":"en","partner_id":"281391093"}
+}
+
+INTENT_SYSTEM = """Du bist ein Intent-Erkennungs-System fuer einen persoenlichen Assistenten eines Paares.
+Karsten (ID: 281391093) spricht Deutsch.
+Kate (ID: 934428072) spricht Englisch.
+Sie teilen einen gemeinsamen Google Kalender.
+
+Analysiere die Nachricht und gib NUR ein JSON-Objekt zurueck, kein anderer Text.
+
+Moegliche Intents:
+- create_event: Termin erstellen
+- query_events: Termine abfragen
+- create_note: Notiz speichern
+- create_todo: Aufgabe erstellen
+- query_todos: Aufgaben abfragen
+- delete_event: Termin loeschen
+- general: Allgemeine Frage oder Konversation
+
+Fuer "affects" entscheide wer betroffen ist:
+- "self": nur die schreibende Person
+- "partner": nur der Partner
+- "both": beide
+
+Beispiele:
+- "remind me tomorrow" → affects: "self"
+- "remind Kate about yoga" → affects: "partner"
+- "we have dinner Saturday" → affects: "both"
+- "my doctor appointment" → affects: "self"
+- "Kate is teaching Thursday" → affects: "partner"
+
+Format:
+{
+  "intent": "create_event",
+  "title": "Titel des Termins",
+  "date": "YYYY-MM-DD oder null",
+  "time": "HH:MM oder null",
+  "duration_hours": 1,
+  "allday": false,
+  "affects": "self",
+  "persons": [],
+  "location": null,
+  "notes": null,
+  "text": "Originalnachricht fuer allgemeine Antwort"
+}"""
+
+def detect_intent(user_message, user_id, context_data):
+    tz=pytz.timezone(TIMEZONE)
+    now_str=datetime.now(tz).strftime("%d.%m.%Y %H:%M")
+    user_name=USER_NAMES.get(user_id,"")
+    user_info=USERS.get(user_id,{})
+    partner_id=user_info.get("partner_id","")
+    partner_name=USER_NAMES.get(partner_id,"Partner")
+    
+    user_context = "\nSchreibende Person: " + user_name + " (ID: " + user_id + ")"
+    user_context += "\nPartner: " + partner_name + " (ID: " + partner_id + ")"
+    user_context += "\nSprache: " + user_info.get("lang","de")
+    
+    prompt = INTENT_SYSTEM + "\n\nAktuelle Zeit: " + now_str + user_context + "\n\nNachricht: " + user_message
+    
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role":"user","content":prompt}],
+        max_tokens=300,
+        response_format={"type":"json_object"}
+    )
+    
+    try:
+        result = json.loads(response.choices[0].message.content)
+        return result
+    except:
+        return {"intent":"general","text":user_message}
+
+def execute_intent(intent_data, user_id, context_data):
+    intent = intent_data.get("intent","general")
+    affects = intent_data.get("affects","self")
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz)
+    user_name = USER_NAMES.get(user_id,"")
+    user_info = USERS.get(user_id,{})
+    partner_id = user_info.get("partner_id","")
+    partner_name = USER_NAMES.get(partner_id,"Partner")
+    
+    # Determine who the action is for
+    if affects == "partner":
+        target_name = partner_name
+        notify_id = partner_id
+    elif affects == "both":
+        target_name = user_name + " & " + partner_name
+        notify_id = None
+    else:
+        target_name = user_name
+        notify_id = None
+    
+    if intent == "create_event":
+        title = intent_data.get("title","Termin")
+        date_str = intent_data.get("date")
+        time_str = intent_data.get("time","09:00")
+        allday = intent_data.get("allday",False)
+        duration = intent_data.get("duration_hours",1)
+        
+        if not date_str:
+            return "Ich brauche noch ein Datum fuer den Termin. Wann soll er stattfinden?"
+        
+        if not time_str:
+            time_str = "09:00"
+        
+        try:
+            dt_str = date_str + " " + time_str
+            dt = tz.localize(datetime.strptime(dt_str, "%Y-%m-%d %H:%M"))
+            end_dt = dt + timedelta(hours=duration)
+            
+            conflicts = check_collision(dt, end_dt)
+            if conflicts:
+                free = find_free_slots(dt)
+                msg = "Konflikt! '" + title + "' kollidiert mit: " + ", ".join(conflicts)
+                if free:
+                    msg += "\nFreie Slots: " + ", ".join(free)
+                msg += "\nTrotzdem eintragen? Antworte mit JA."
+                return msg, {"title":title,"dt":dt.isoformat().split("+")[0]}
+            
+            ok = add_calendar_event(title, dt, end_dt)
+            if ok:
+                return "Termin eingetragen: " + title + " am " + dt.strftime("%d.%m.%Y um %H:%M Uhr"), None
+            else:
+                return "Fehler beim Eintragen!", None
+        except Exception as e:
+            return "Fehler: " + str(e), None
+    
+    elif intent == "query_events":
+        events = get_upcoming_events(14)
+        if user_name:
+            return "Hier sind eure naechsten Termine, " + user_name + ":\n" + events, None
+        return "Hier sind eure naechsten Termine:\n" + events, None
+    
+    elif intent == "create_note":
+        text = intent_data.get("text","")
+        data_file = load_data()
+        data_file["notes"].append({"text":text,"datum":now.strftime("%d.%m.%Y %H:%M")})
+        save_data(data_file)
+        return "Notiz gespeichert: " + text, None
+    
+    elif intent == "create_todo":
+        text = intent_data.get("text","")
+        data_file = load_data()
+        data_file["todos"].append({"text":text,"erledigt":False,"datum":now.strftime("%d.%m.%Y %H:%M")})
+        save_data(data_file)
+        return "Aufgabe gespeichert: " + text, None
+    
+    elif intent == "query_todos":
+        data_file = load_data()
+        todos = data_file.get("todos",[])
+        offen = [t for t in todos if not t["erledigt"]]
+        if not offen:
+            return "Keine offenen Aufgaben!", None
+        out = "\n".join(["- " + t["text"] for t in offen])
+        return "Offene Aufgaben:\n" + out, None
+    
+    else:
+        return None, None
+
 async def ask_gpt(user_message,user_id,context_data):
     tz=pytz.timezone(TIMEZONE)
     now_str=datetime.now(tz).strftime("%d.%m.%Y %H:%M")
@@ -251,7 +415,7 @@ async def handle_text(update,context):
             save_data(data)
             if ok:
                 await update.message.reply_text("Termin eingetragen: "+pending["title"]+" am "+dt.strftime("%d.%m.%Y um %H:%M Uhr"))
-            else:
+            else:                
                 await update.message.reply_text("Fehler beim Eintragen!")
             return
         elif ":" in text:
@@ -281,16 +445,23 @@ async def handle_text(update,context):
             await update.message.reply_text("OK, Termin nicht eingetragen.")
             return
     await update.message.chat.send_action("typing")
-    response=await ask_gpt(text,user_id,data)
-    if "Konflikt!" in response and "Trotzdem eintragen?" in response:
-        import re
-        title_match=re.search(r"Konflikt! '(.+?)'",response)
-        dt_match=data.get("last_event_dt",None)
-        if title_match and dt_match:
-            data["pending_event"]={"title":title_match.group(1),"dt":dt_match}
-    response,pending=process_calendar(response,data)
+    intent_data = detect_intent(text, user_id, data)
+    intent = intent_data.get("intent","general")
+    pending = None
+    if intent in ["create_event","query_events","create_note","create_todo","query_todos"]:
+        result = execute_intent(intent_data, user_id, data)
+        if isinstance(result, tuple):
+            response, pending = result
+        else:
+            response = result
+        if response is None:
+            response = await ask_gpt(text, user_id, data)
+            response, pending = process_calendar(response, data)
+    else:
+        response = await ask_gpt(text, user_id, data)
+        response, pending = process_calendar(response, data)
     if pending:
-        data["pending_event"]=pending
+        data["pending_event"] = pending
     data["conversation"].append({"role":"user","content":text})
     data["conversation"].append({"role":"assistant","content":response})
     if len(data["conversation"])>20:
@@ -341,10 +512,23 @@ async def handle_voice(update,context):
     os.unlink(tmp_path)
     user_name=USER_NAMES.get(user_id,"")
     await update.message.reply_text("Gehoert: "+(user_name+": " if user_name else "")+text)
-    response=await ask_gpt(text,user_id,data)
-    response,pending=process_calendar(response,data)
+    intent_data = detect_intent(text, user_id, data)
+    intent = intent_data.get("intent","general")
+    pending = None
+    if intent in ["create_event","query_events","create_note","create_todo","query_todos"]:
+        result = execute_intent(intent_data, user_id, data)
+        if isinstance(result, tuple):
+            response, pending = result
+        else:
+            response = result
+        if response is None:
+            response = await ask_gpt(text, user_id, data)
+            response, pending = process_calendar(response, data)
+    else:
+        response = await ask_gpt(text, user_id, data)
+        response, pending = process_calendar(response, data)
     if pending:
-        data["pending_event"]=pending
+        data["pending_event"] = pending
     data["conversation"].append({"role":"user","content":text})
     data["conversation"].append({"role":"assistant","content":response})
     if len(data["conversation"])>20:
@@ -372,3 +556,4 @@ def main():
 
 if __name__=="__main__":
     main()
+    
