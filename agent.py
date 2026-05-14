@@ -208,13 +208,21 @@ Sie teilen einen gemeinsamen Google Kalender.
 Analysiere die Nachricht und gib NUR ein JSON-Objekt zurueck, kein anderer Text.
 
 Moegliche Intents:
-- create_event: Termin erstellen
-- query_events: Termine abfragen
-- create_note: Notiz speichern
-- create_todo: Aufgabe erstellen
-- query_todos: Aufgaben abfragen
+- create_event: Termin mit fester Uhrzeit erstellen
+- create_task: Aufgabe/Todo ohne feste Uhrzeit → wird als ganztaegiger Kalendereintrag eingetragen
+- create_list: Einkaufsliste oder Sammlung → wird als ganztaegiger Eintrag mit Emoji eingetragen
+- create_note: Kurze Notiz ohne Aktion
+- query_events: Termine und Aufgaben abfragen
 - delete_event: Termin loeschen
 - general: Allgemeine Frage oder Konversation
+
+Entscheide so:
+- Hat eine Uhrzeit → create_event
+- Ist eine Aufgabe/Todo mit oder ohne Deadline → create_task
+- Ist eine Liste (Einkauf, Packliste etc.) → create_list
+- "remind X" mit Zeit → create_event
+- "remind X" ohne Zeit → create_task
+- Kurze Info ohne Aktion → create_note
 
 Fuer "affects" entscheide wer betroffen ist:
 - "self": nur die schreibende Person
@@ -332,28 +340,64 @@ def execute_intent(intent_data, user_id, context_data):
             return "Hier sind eure naechsten Termine, " + user_name + ":\n" + events, None
         return "Hier sind eure naechsten Termine:\n" + events, None
     
+    elif intent == "create_task":
+        text = intent_data.get("text") or intent_data.get("title","Aufgabe")
+        deadline = intent_data.get("date")
+        if deadline:
+            try:
+                d = date.fromisoformat(deadline)
+                dt = tz.localize(datetime(d.year,d.month,d.day,0,0))
+            except:
+                dt = tz.localize(datetime(now.year,now.month,now.day,0,0))
+        else:
+            dt = tz.localize(datetime(now.year,now.month,now.day,0,0))
+        event = {
+            "summary": "✅ " + text,
+            "start": {"date": dt.strftime("%Y-%m-%d")},
+            "end": {"date": (dt + timedelta(days=1)).strftime("%Y-%m-%d")}
+        }
+        try:
+            service = get_calendar_service()
+            if service:
+                service.events().insert(calendarId=CALENDAR_ID,body=event).execute()
+                return "Aufgabe im Kalender eingetragen: ✅ " + text + " (" + dt.strftime("%d.%m.%Y") + ")", None
+        except Exception as e:
+            pass
+        return "Fehler beim Eintragen der Aufgabe!", None
+
+    elif intent == "create_list":
+        items = intent_data.get("items") or intent_data.get("text","Liste")
+        if isinstance(items, list):
+            items_str = ", ".join(items)
+        else:
+            items_str = str(items)
+        dt = tz.localize(datetime(now.year,now.month,now.day,0,0))
+        event = {
+            "summary": "🛒 " + items_str,
+            "start": {"date": dt.strftime("%Y-%m-%d")},
+            "end": {"date": (dt + timedelta(days=1)).strftime("%Y-%m-%d")}
+        }
+        try:
+            service = get_calendar_service()
+            if service:
+                service.events().insert(calendarId=CALENDAR_ID,body=event).execute()
+                return "Liste im Kalender eingetragen: 🛒 " + items_str, None
+        except Exception as e:
+            pass
+        return "Fehler beim Eintragen der Liste!", None
+
     elif intent == "create_note":
         text = intent_data.get("text","")
         data_file = load_data()
+        if "notes" not in data_file:
+            data_file["notes"] = []
         data_file["notes"].append({"text":text,"datum":now.strftime("%d.%m.%Y %H:%M")})
         save_data(data_file)
         return "Notiz gespeichert: " + text, None
-    
-    elif intent == "create_todo":
-        text = intent_data.get("text","")
-        data_file = load_data()
-        data_file["todos"].append({"text":text,"erledigt":False,"datum":now.strftime("%d.%m.%Y %H:%M")})
-        save_data(data_file)
-        return "Aufgabe gespeichert: " + text, None
-    
-    elif intent == "query_todos":
-        data_file = load_data()
-        todos = data_file.get("todos",[])
-        offen = [t for t in todos if not t["erledigt"]]
-        if not offen:
-            return "Keine offenen Aufgaben!", None
-        out = "\n".join(["- " + t["text"] for t in offen])
-        return "Offene Aufgaben:\n" + out, None
+
+    elif intent in ["query_todos","query_events"]:
+        events = get_upcoming_events(14)
+        return "Hier sind eure naechsten Termine und Aufgaben:\n" + events, None
     
     else:
         return None, None
