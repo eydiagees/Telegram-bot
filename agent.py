@@ -397,8 +397,22 @@ def execute_intent(intent_data, user_id, context_data):
         return "Notiz gespeichert: " + text, None
 
     elif intent in ["query_todos","query_events"]:
-        events = get_upcoming_events(14)
-        return "Hier sind eure naechsten Termine und Aufgaben:\n" + events, None
+        # Check if user asks for today, tomorrow or week
+        text_lower = intent_data.get("text","").lower()
+        if any(w in text_lower for w in ["heute","today","jetzt","now"]):
+            days = 1
+            label = "Heute"
+        elif any(w in text_lower for w in ["morgen","tomorrow"]):
+            days = 2
+            label = "Morgen"
+        elif any(w in text_lower for w in ["woche","week"]):
+            days = 7
+            label = "Diese Woche"
+        else:
+            days = 7
+            label = "Naechste Zeit"
+        events = get_upcoming_events(days)
+        return label + ":\n" + events, None
     
     elif intent == "send_briefing":
         return "SEND_BRIEFING", None
