@@ -229,6 +229,9 @@ async def transcribe_voice(file_path):
 def is_allowed(update):
     return True
 
+JA_WORDS=["JA","YES","J","Y","YEP","YA","JO","SURE","OK","OKAY","DO IT","MACH ES","EINTRAGEN","ADD IT","GO","JETZT","NOW"]
+NEIN_WORDS=["NEIN","NO","CANCEL","ABBRECHEN","STOP","NOPE","NEE","NAH","NICHT","VERGISS ES","FORGET IT","SKIP","LASS ES"]
+
 async def handle_text(update,context):
     if not is_allowed(update):
         await update.message.reply_text("Kein Zugriff.")
@@ -239,7 +242,7 @@ async def handle_text(update,context):
     pending=data.get("pending_event",None)
     if pending:
         txt=text.strip().upper()
-        if txt=="JA":
+        if any(txt==w or txt.startswith(w) for w in JA_WORDS):
             tz=pytz.timezone(TIMEZONE)
             dt=tz.localize(datetime.fromisoformat(pending["dt"]))
             end_dt=dt+timedelta(hours=1)
@@ -272,7 +275,7 @@ async def handle_text(update,context):
                     return
             except:
                 pass
-        elif any(txt==w or txt.startswith(w) for w in nein_words):
+        elif any(txt==w or txt.startswith(w) for w in NEIN_WORDS):
             del data["pending_event"]
             save_data(data)
             await update.message.reply_text("OK, Termin nicht eingetragen.")
@@ -301,6 +304,33 @@ async def handle_voice(update,context):
         return
     user_id=str(update.effective_user.id)
     data=load_data()
+    pending=data.get("pending_event",None)
+    if pending:
+        await update.message.chat.send_action("typing")
+        voice=update.message.voice
+        voice_file=await context.bot.get_file(voice.file_id)
+        import tempfile as tf
+        with tf.NamedTemporaryFile(suffix=".ogg",delete=False) as tmp:
+            tmp_path=tmp.name
+        await voice_file.download_to_drive(tmp_path)
+        txt_voice=await transcribe_voice(tmp_path)
+        os.unlink(tmp_path)
+        txt_upper=txt_voice.strip().upper().replace("!","").replace(".","").strip()
+        if any(txt_upper==w or txt_upper.startswith(w) for w in JA_WORDS):
+            tz=pytz.timezone(TIMEZONE)
+            dt=tz.localize(datetime.fromisoformat(pending["dt"]))
+            end_dt=dt+timedelta(hours=1)
+            ok=add_calendar_event(pending["title"],dt,end_dt)
+            del data["pending_event"]
+            save_data(data)
+            msg="Termin eingetragen: "+pending["title"]+" am "+dt.strftime("%d.%m.%Y um %H:%M Uhr") if ok else "Fehler beim Eintragen!"
+            await update.message.reply_text(msg)
+            return
+        elif any(txt_upper==w or txt_upper.startswith(w) for w in NEIN_WORDS):
+            del data["pending_event"]
+            save_data(data)
+            await update.message.reply_text("OK, Termin nicht eingetragen.")
+            return
     await update.message.chat.send_action("typing")
     voice=update.message.voice
     voice_file=await context.bot.get_file(voice.file_id)
