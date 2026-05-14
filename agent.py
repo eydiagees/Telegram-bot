@@ -80,8 +80,9 @@ def find_free_slots(dt,duration_hours=1):
             orderBy="startTime"
         ).execute()
         events=result.get("items",[])
-        slots=[]
-        current=day_start
+       slots=[]
+        now_local=datetime.now(tz)
+        current=max(day_start,now_local)
         for e in events:
             e_start=datetime.fromisoformat(e["start"].get("dateTime",e["start"].get("date","")))
             if not e_start.tzinfo:
