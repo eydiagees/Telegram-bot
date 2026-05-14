@@ -233,9 +233,58 @@ async def handle_text(update,context):
     user_id=str(update.effective_user.id)
     text=update.message.text
     data=load_data()
+    pending=data.get("pending_event",None)
+    if pending:
+        txt=text.strip().upper()
+        if txt=="JA":
+            tz=pytz.timezone(TIMEZONE)
+            dt=tz.localize(datetime.fromisoformat(pending["dt"]))
+            end_dt=dt+timedelta(hours=1)
+            ok=add_calendar_event(pending["title"],dt,end_dt)
+            del data["pending_event"]
+            save_data(data)
+            if ok:
+                await update.message.reply_text("Termin eingetragen: "+pending["title"]+" am "+dt.strftime("%d.%m.%Y um %H:%M Uhr"))
+            else:
+                await update.message.reply_text("Fehler beim Eintragen!")
+            return
+        elif ":" in text:
+            try:
+                import re
+                time_match=re.search(r"(\d{1,2}:\d{2})",text)
+                if time_match:
+                    old_dt=datetime.fromisoformat(pending["dt"])
+                    new_time=time_match.group(1).split(":")
+                    new_dt=old_dt.replace(hour=int(new_time[0]),minute=int(new_time[1]))
+                    tz=pytz.timezone(TIMEZONE)
+                    new_dt=tz.localize(new_dt)
+                    end_dt=new_dt+timedelta(hours=1)
+                    ok=add_calendar_event(pending["title"],new_dt,end_dt)
+                    del data["pending_event"]
+                    save_data(data)
+                    if ok:
+                        await update.message.reply_text("Termin eingetragen: "+pending["title"]+" am "+new_dt.strftime("%d.%m.%Y um %H:%M Uhr"))
+                    else:
+                        await update.message.reply_text("Fehler beim Eintragen!")
+                    return
+            except:
+                pass
+        elif txt in ["NEIN","NO","CANCEL","ABBRECHEN"]:
+            del data["pending_event"]
+            save_data(data)
+            await update.message.reply_text("OK, Termin nicht eingetragen.")
+            return
     await update.message.chat.send_action("typing")
     response=await ask_gpt(text,user_id,data)
+    if "Konflikt!" in response and "Trotzdem eintragen?" in response:
+        import re
+        title_match=re.search(r"Konflikt! '(.+?)'",response)
+        dt_match=data.get("last_event_dt",None)
+        if title_match and dt_match:
+            data["pending_event"]={"title":title_match.group(1),"dt":dt_match}
     response=process_calendar(response)
+    if "pending_event" not in data and "KALENDER_TERMIN:" in response:
+        pass
     data["conversation"].append({"role":"user","content":text})
     data["conversation"].append({"role":"assistant","content":response})
     if len(data["conversation"])>20:
