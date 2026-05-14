@@ -215,7 +215,7 @@ Moegliche Intents:
 - query_events: Termine und Aufgaben abfragen
 - delete_event: Termin loeschen
 - general: Allgemeine Frage oder Konversation
-- send_briefing: Morgen-Briefing jetzt senden (wenn jemand "briefing", "morgen-briefing", "was steht an" sagt)
+- send_briefing: Morgen-Briefing jetzt senden. Trigger-Woerter: "briefing", "morning briefing", "morning-briefing", "tagesueberblick", "was steht an", "was haben wir heute", "schick das briefing", "daily briefing", "tagesplan", "ueberblick"
 
 Entscheide so:
 - Hat eine Uhrzeit → create_event
