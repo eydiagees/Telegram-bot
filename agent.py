@@ -1,4 +1,4 @@
-import os,json,tempfile,logging
+import os,json,tempfile,logging,re
 from datetime import datetime,timedelta,date
 from telegram import Update
 from telegram.ext import ApplicationBuilder,MessageHandler,CommandHandler,ContextTypes,filters
@@ -26,22 +26,30 @@ for entry in os.environ.get("USER_NAMES","").split(","):
 client=OpenAI(api_key=OPENAI_API_KEY)
 DATA_FILE="agent_data.json"
 
+USERS={
+    "281391093":{"name":"Karsten","lang":"de","partner_id":"934428072"},
+    "934428072":{"name":"Kate","lang":"en","partner_id":"281391093"}
+}
+
+JA_WORDS=["JA","YES","J","Y","YEP","YA","JO","SURE","OK","OKAY","DO IT","MACH ES","EINTRAGEN","ADD IT","GO","JETZT","NOW"]
+NEIN_WORDS=["NEIN","NO","CANCEL","ABBRECHEN","STOP","NOPE","NEE","NAH","NICHT","VERGISS ES","FORGET IT","SKIP","LASS ES"]
+BRIEFING_KEYWORDS=["tagesplan","briefing","was steht an","mein tag","morning briefing","daily briefing","was haben wir heute","ueberblick","schick briefing"]
+
+# ── Datenpersistenz ───────────────────────────────────────────────────────────
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE,"r",encoding="utf-8") as f:
             return json.load(f)
-    return {"notes":[],"todos":[],"conversation":[]}
+    return {"notes":[],"todos":[],"conversation":[],"memory":{"persons":{},"patterns":{},"preferences":{}},"pending_event":None}
 
 def save_data(data):
     with open(DATA_FILE,"w",encoding="utf-8") as f:
         json.dump(data,f,ensure_ascii=False,indent=2)
 
+# ── Google Calendar ───────────────────────────────────────────────────────────
 def get_calendar_service():
     try:
-        creds=service_account.Credentials.from_service_account_file(
-            GOOGLE_CREDS,
-            scopes=["https://www.googleapis.com/auth/calendar"]
-        )
+        creds=service_account.Credentials.from_service_account_file(GOOGLE_CREDS,scopes=["https://www.googleapis.com/auth/calendar"])
         return build("calendar","v3",credentials=creds)
     except Exception as e:
         logger.error(f"Cal error: {e}")
@@ -52,16 +60,9 @@ def check_collision(start_dt,end_dt):
         service=get_calendar_service()
         if not service:
             return []
-        result=service.events().list(
-            calendarId=CALENDAR_ID,
-            timeMin=start_dt.isoformat(),
-            timeMax=end_dt.isoformat(),
-            singleEvents=True,
-            orderBy="startTime"
-        ).execute()
-        events=result.get("items",[])
-        return [e.get("summary","?") for e in events]
-    except Exception as e:
+        result=service.events().list(calendarId=CALENDAR_ID,timeMin=start_dt.isoformat(),timeMax=end_dt.isoformat(),singleEvents=True,orderBy="startTime").execute()
+        return [e.get("summary","?") for e in result.get("items",[])]
+    except:
         return []
 
 def find_free_slots(dt,duration_hours=1):
@@ -72,13 +73,7 @@ def find_free_slots(dt,duration_hours=1):
         tz=pytz.timezone(TIMEZONE)
         day_start=tz.localize(datetime(dt.year,dt.month,dt.day,8,0))
         day_end=tz.localize(datetime(dt.year,dt.month,dt.day,20,0))
-        result=service.events().list(
-            calendarId=CALENDAR_ID,
-            timeMin=day_start.isoformat(),
-            timeMax=day_end.isoformat(),
-            singleEvents=True,
-            orderBy="startTime"
-        ).execute()
+        result=service.events().list(calendarId=CALENDAR_ID,timeMin=day_start.isoformat(),timeMax=day_end.isoformat(),singleEvents=True,orderBy="startTime").execute()
         events=result.get("items",[])
         slots=[]
         now_local=datetime.now(tz)
@@ -87,18 +82,16 @@ def find_free_slots(dt,duration_hours=1):
             e_start=datetime.fromisoformat(e["start"].get("dateTime",e["start"].get("date","")))
             if not e_start.tzinfo:
                 e_start=tz.localize(e_start)
-            gap=(e_start-current).total_seconds()/3600
-            if gap>=duration_hours:
+            if (e_start-current).total_seconds()/3600>=duration_hours:
                 slots.append(current.strftime("%H:%M")+" - "+e_start.strftime("%H:%M"))
             e_end=datetime.fromisoformat(e["end"].get("dateTime",e["end"].get("date","")))
             if not e_end.tzinfo:
                 e_end=tz.localize(e_end)
             current=max(current,e_end)
-        gap=(day_end-current).total_seconds()/3600
-        if gap>=duration_hours:
+        if (day_end-current).total_seconds()/3600>=duration_hours:
             slots.append(current.strftime("%H:%M")+" - "+day_end.strftime("%H:%M"))
         return slots[:3]
-    except Exception as e:
+    except:
         return []
 
 def add_calendar_event(title,start_dt,end_dt=None):
@@ -108,15 +101,23 @@ def add_calendar_event(title,start_dt,end_dt=None):
             return False
         if end_dt is None:
             end_dt=start_dt+timedelta(hours=1)
-        event={
-            "summary":title,
-            "start":{"dateTime":start_dt.isoformat(),"timeZone":TIMEZONE},
-            "end":{"dateTime":end_dt.isoformat(),"timeZone":TIMEZONE}
-        }
+        event={"summary":title,"start":{"dateTime":start_dt.isoformat(),"timeZone":TIMEZONE},"end":{"dateTime":end_dt.isoformat(),"timeZone":TIMEZONE}}
         service.events().insert(calendarId=CALENDAR_ID,body=event).execute()
         return True
     except Exception as e:
         logger.error(f"Event error: {e}")
+        return False
+
+def add_allday_event(title,dt):
+    try:
+        service=get_calendar_service()
+        if not service:
+            return False
+        event={"summary":title,"start":{"date":dt.strftime("%Y-%m-%d")},"end":{"date":(dt+timedelta(days=1)).strftime("%Y-%m-%d")}}
+        service.events().insert(calendarId=CALENDAR_ID,body=event).execute()
+        return True
+    except Exception as e:
+        logger.error(f"Allday error: {e}")
         return False
 
 def get_upcoming_events(days=7):
@@ -127,14 +128,7 @@ def get_upcoming_events(days=7):
         tz=pytz.timezone(TIMEZONE)
         now=datetime.now(tz).isoformat()
         end=(datetime.now(tz)+timedelta(days=days)).isoformat()
-        result=service.events().list(
-            calendarId=CALENDAR_ID,
-            timeMin=now,
-            timeMax=end,
-            maxResults=20,
-            singleEvents=True,
-            orderBy="startTime"
-        ).execute()
+        result=service.events().list(calendarId=CALENDAR_ID,timeMin=now,timeMax=end,maxResults=20,singleEvents=True,orderBy="startTime").execute()
         events=result.get("items",[])
         if not events:
             return "Keine Termine."
@@ -151,13 +145,156 @@ def get_upcoming_events(days=7):
     except Exception as e:
         return f"Fehler: {e}"
 
+# ── Gedaechtnis ───────────────────────────────────────────────────────────────
+def get_memory_context():
+    data=load_data()
+    memory=data.get("memory",{})
+    if not memory.get("persons") and not memory.get("patterns"):
+        return ""
+    ctx="\nBekannte Personen:\n"
+    for name,info in memory.get("persons",{}).items():
+        ctx+=f"- {name}: {info.get('relation','')} von {info.get('relevant_for','')}"
+        if info.get("notes"):
+            ctx+=f" ({info['notes']})"
+        ctx+="\n"
+    if memory.get("patterns"):
+        ctx+="\nBekannte Muster:\n"
+        for key,val in memory["patterns"].items():
+            ctx+=f"- {key}: {val}\n"
+    return ctx
+
+def update_memory_from_message(user_message,user_id,gpt_response):
+    try:
+        user_name=USER_NAMES.get(user_id,"")
+        extract_prompt="""Analysiere und extrahiere merkenswerte Informationen. Gib NUR JSON zurueck oder {}.
+Format: {"persons":{"Name":{"relation":"...","relevant_for":"...","notes":"..."}},"patterns":{"beschreibung":"wann"},"preferences":{"key":"value"}}
+Nutzer: """+user_name+"\nNachricht: "+user_message+"\nAntwort: "+gpt_response
+        response=client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":extract_prompt}],max_tokens=300,response_format={"type":"json_object"})
+        extracted=json.loads(response.choices[0].message.content)
+        if not extracted:
+            return
+        data=load_data()
+        memory=data.get("memory",{"persons":{},"patterns":{},"preferences":{}})
+        for name,info in extracted.get("persons",{}).items():
+            if name not in memory["persons"]:
+                memory["persons"][name]=info
+            else:
+                memory["persons"][name].update(info)
+        memory["patterns"].update(extracted.get("patterns",{}))
+        memory["preferences"].update(extracted.get("preferences",{}))
+        data["memory"]=memory
+        save_data(data)
+    except:
+        pass
+
+# ── Intent Engine ─────────────────────────────────────────────────────────────
+INTENT_SYSTEM="""Du bist ein Intent-Erkennungs-System. Analysiere die Nachricht und gib NUR JSON zurueck.
+Karsten (ID: 281391093) spricht Deutsch. Kate (ID: 934428072) spricht Englisch.
+
+Intents:
+- create_event: Termin mit Uhrzeit
+- create_task: Aufgabe/Todo ohne Uhrzeit -> ganztaegig im Kalender
+- create_list: Einkaufsliste -> ganztaegig mit Emoji
+- create_note: Kurze Notiz
+- query_events: Termine abfragen
+- general: Alles andere
+
+Affects: "self"=nur Schreiber, "partner"=nur Partner, "both"=beide
+
+Format: {"intent":"create_event","title":"...","date":"YYYY-MM-DD","time":"HH:MM","duration_hours":1,"allday":false,"affects":"self","text":"...","items":[]}"""
+
+def detect_intent(user_message,user_id,context_data):
+    tz=pytz.timezone(TIMEZONE)
+    now_str=datetime.now(tz).strftime("%d.%m.%Y %H:%M")
+    user_name=USER_NAMES.get(user_id,"")
+    user_info=USERS.get(user_id,{})
+    partner_id=user_info.get("partner_id","")
+    partner_name=USER_NAMES.get(partner_id,"Partner")
+    prompt=INTENT_SYSTEM+"\n\nZeit: "+now_str+"\nSchreiber: "+user_name+"\nPartner: "+partner_name+"\nNachricht: "+user_message
+    try:
+        response=client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":prompt}],max_tokens=300,response_format={"type":"json_object"})
+        return json.loads(response.choices[0].message.content)
+    except:
+        return {"intent":"general","text":user_message}
+
+def execute_intent(intent_data,user_id,context_data):
+    intent=intent_data.get("intent","general")
+    tz=pytz.timezone(TIMEZONE)
+    now=datetime.now(tz)
+    user_name=USER_NAMES.get(user_id,"")
+
+    if intent=="create_event":
+        title=intent_data.get("title","Termin")
+        date_str=intent_data.get("date")
+        time_str=intent_data.get("time","09:00")
+        duration=intent_data.get("duration_hours",1)
+        if not date_str:
+            return "Ich brauche noch ein Datum. Wann soll der Termin stattfinden?",None
+        if not time_str:
+            time_str="09:00"
+        try:
+            dt=tz.localize(datetime.strptime(date_str+" "+time_str,"%Y-%m-%d %H:%M"))
+            end_dt=dt+timedelta(hours=duration)
+            conflicts=check_collision(dt,end_dt)
+            if conflicts:
+                free=find_free_slots(dt)
+                msg="Konflikt! '"+title+"' kollidiert mit: "+", ".join(conflicts)
+                if free:
+                    msg+="\nFreie Slots: "+", ".join(free)
+                msg+="\nTrotzdem eintragen? Antworte mit JA."
+                return msg,{"title":title,"dt":dt.isoformat().split("+")[0]}
+            ok=add_calendar_event(title,dt,end_dt)
+            return ("Termin eingetragen: "+title+" am "+dt.strftime("%d.%m.%Y um %H:%M Uhr") if ok else "Fehler beim Eintragen!"),None
+        except Exception as e:
+            return "Fehler: "+str(e),None
+
+    elif intent=="create_task":
+        text=intent_data.get("text") or intent_data.get("title","Aufgabe")
+        deadline=intent_data.get("date")
+        try:
+            if deadline:
+                d=date.fromisoformat(deadline)
+                dt=datetime(d.year,d.month,d.day)
+            else:
+                dt=now
+            ok=add_allday_event("✅ "+text,dt)
+            return ("Aufgabe eingetragen: ✅ "+text if ok else "Fehler!"),None
+        except Exception as e:
+            return "Fehler: "+str(e),None
+
+    elif intent=="create_list":
+        items=intent_data.get("items") or intent_data.get("text","Liste")
+        items_str=", ".join(items) if isinstance(items,list) else str(items)
+        ok=add_allday_event("🛒 "+items_str,now)
+        return ("Liste eingetragen: 🛒 "+items_str if ok else "Fehler!"),None
+
+    elif intent=="create_note":
+        text=intent_data.get("text","")
+        data=load_data()
+        if "notes" not in data:
+            data["notes"]=[]
+        data["notes"].append({"text":text,"datum":now.strftime("%d.%m.%Y %H:%M")})
+        save_data(data)
+        return "Notiz gespeichert: "+text,None
+
+    elif intent=="query_events":
+        text_lower=intent_data.get("text","").lower()
+        if any(w in text_lower for w in ["heute","today"]):
+            days,label=1,"Heute"
+        elif any(w in text_lower for w in ["morgen","tomorrow"]):
+            days,label=2,"Morgen"
+        else:
+            days,label=7,"Naechste 7 Tage"
+        return label+":\n"+get_upcoming_events(days),None
+
+    return None,None
+
 def process_calendar(response,data=None):
     if "KALENDER_TERMIN:" not in response:
         return response,None
     results=[]
     pending=None
-    lines=response.strip().split("\n")
-    for line in lines:
+    for line in response.strip().split("\n"):
         line=line.strip()
         if not line.startswith("KALENDER_TERMIN:"):
             continue
@@ -170,8 +307,7 @@ def process_calendar(response,data=None):
                 d=date.fromisoformat(dt_str)
                 dt=tz.localize(datetime(d.year,d.month,d.day,9,0))
             else:
-                dt_str=dt_str[:16]
-                dt=tz.localize(datetime.fromisoformat(dt_str))
+                dt=tz.localize(datetime.fromisoformat(dt_str[:16]))
             end_dt=dt+timedelta(hours=1)
             conflicts=check_collision(dt,end_dt)
             if conflicts:
@@ -184,240 +320,10 @@ def process_calendar(response,data=None):
                 pending={"title":title,"dt":dt.isoformat().split("+")[0]}
             else:
                 ok=add_calendar_event(title,dt,end_dt)
-                if ok:
-                    results.append("Termin eingetragen: "+title+" am "+dt.strftime("%d.%m.%Y um %H:%M Uhr"))
-                else:
-                    results.append("Fehler bei: "+title)
+                results.append("Termin eingetragen: "+title+" am "+dt.strftime("%d.%m.%Y um %H:%M Uhr") if ok else "Fehler bei: "+title)
         except Exception as e:
             results.append("Fehler: "+str(e))
-    if results:
-        return "\n".join(results),pending
-    return response,None
-
-
-USERS = {
-    "281391093": {"name":"Karsten","lang":"de","partner_id":"934428072"},
-    "934428072": {"name":"Kate","lang":"en","partner_id":"281391093"}
-}
-
-INTENT_SYSTEM = """Du bist ein Intent-Erkennungs-System fuer einen persoenlichen Assistenten eines Paares.
-Karsten (ID: 281391093) spricht Deutsch.
-Kate (ID: 934428072) spricht Englisch.
-Sie teilen einen gemeinsamen Google Kalender.
-
-Analysiere die Nachricht und gib NUR ein JSON-Objekt zurueck, kein anderer Text.
-
-Moegliche Intents:
-- create_event: Termin mit fester Uhrzeit erstellen
-- create_task: Aufgabe/Todo ohne feste Uhrzeit → wird als ganztaegiger Kalendereintrag eingetragen
-- create_list: Einkaufsliste oder Sammlung → wird als ganztaegiger Eintrag mit Emoji eingetragen
-- create_note: Kurze Notiz ohne Aktion
-- query_events: Termine und Aufgaben abfragen
-- delete_event: Termin loeschen
-- general: Allgemeine Frage oder Konversation
-- send_briefing: Morgen-Briefing jetzt senden (wenn jemand "briefing", "morgen-briefing", "was steht an" sagt)
-
-Entscheide so:
-- Hat eine Uhrzeit → create_event
-- Ist eine Aufgabe/Todo mit oder ohne Deadline → create_task
-- Ist eine Liste (Einkauf, Packliste etc.) → create_list
-- "remind X" mit Zeit → create_event
-- "remind X" ohne Zeit → create_task
-- Kurze Info ohne Aktion → create_note
-
-Fuer "affects" entscheide wer betroffen ist:
-- "self": nur die schreibende Person
-- "partner": nur der Partner
-- "both": beide
-
-Beispiele:
-- "remind me tomorrow" → affects: "self"
-- "remind Kate about yoga" → affects: "partner"
-- "we have dinner Saturday" → affects: "both"
-- "my doctor appointment" → affects: "self"
-- "Kate is teaching Thursday" → affects: "partner"
-
-Format:
-{
-  "intent": "create_event",
-  "title": "Titel des Termins",
-  "date": "YYYY-MM-DD oder null",
-  "time": "HH:MM oder null",
-  "duration_hours": 1,
-  "allday": false,
-  "affects": "self",
-  "persons": [],
-  "location": null,
-  "notes": null,
-  "text": "Originalnachricht fuer allgemeine Antwort"
-}"""
-
-def detect_intent(user_message, user_id, context_data):
-    tz=pytz.timezone(TIMEZONE)
-    now_str=datetime.now(tz).strftime("%d.%m.%Y %H:%M")
-    user_name=USER_NAMES.get(user_id,"")
-    user_info=USERS.get(user_id,{})
-    partner_id=user_info.get("partner_id","")
-    partner_name=USER_NAMES.get(partner_id,"Partner")
-    
-    user_context = "\nSchreibende Person: " + user_name + " (ID: " + user_id + ")"
-    user_context += "\nPartner: " + partner_name + " (ID: " + partner_id + ")"
-    user_context += "\nSprache: " + user_info.get("lang","de")
-    
-    prompt = INTENT_SYSTEM + "\n\nAktuelle Zeit: " + now_str + user_context + "\n\nNachricht: " + user_message
-    
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role":"user","content":prompt}],
-        max_tokens=300,
-        response_format={"type":"json_object"}
-    )
-    
-    try:
-        result = json.loads(response.choices[0].message.content)
-        return result
-    except:
-        return {"intent":"general","text":user_message}
-
-def execute_intent(intent_data, user_id, context_data):
-    intent = intent_data.get("intent","general")
-    affects = intent_data.get("affects","self")
-    tz = pytz.timezone(TIMEZONE)
-    now = datetime.now(tz)
-    user_name = USER_NAMES.get(user_id,"")
-    user_info = USERS.get(user_id,{})
-    partner_id = user_info.get("partner_id","")
-    partner_name = USER_NAMES.get(partner_id,"Partner")
-    
-    # Determine who the action is for
-    if affects == "partner":
-        target_name = partner_name
-        notify_id = partner_id
-    elif affects == "both":
-        target_name = user_name + " & " + partner_name
-        notify_id = None
-    else:
-        target_name = user_name
-        notify_id = None
-    
-    if intent == "create_event":
-        title = intent_data.get("title","Termin")
-        date_str = intent_data.get("date")
-        time_str = intent_data.get("time","09:00")
-        allday = intent_data.get("allday",False)
-        duration = intent_data.get("duration_hours",1)
-        
-        if not date_str:
-            return "Ich brauche noch ein Datum fuer den Termin. Wann soll er stattfinden?"
-        
-        if not time_str:
-            time_str = "09:00"
-        
-        try:
-            dt_str = date_str + " " + time_str
-            dt = tz.localize(datetime.strptime(dt_str, "%Y-%m-%d %H:%M"))
-            end_dt = dt + timedelta(hours=duration)
-            
-            conflicts = check_collision(dt, end_dt)
-            if conflicts:
-                free = find_free_slots(dt)
-                msg = "Konflikt! '" + title + "' kollidiert mit: " + ", ".join(conflicts)
-                if free:
-                    msg += "\nFreie Slots: " + ", ".join(free)
-                msg += "\nTrotzdem eintragen? Antworte mit JA."
-                return msg, {"title":title,"dt":dt.isoformat().split("+")[0]}
-            
-            ok = add_calendar_event(title, dt, end_dt)
-            if ok:
-                return "Termin eingetragen: " + title + " am " + dt.strftime("%d.%m.%Y um %H:%M Uhr"), None
-            else:
-                return "Fehler beim Eintragen!", None
-        except Exception as e:
-            return "Fehler: " + str(e), None
-    
-    elif intent == "query_events":
-        events = get_upcoming_events(14)
-        if user_name:
-            return "Hier sind eure naechsten Termine, " + user_name + ":\n" + events, None
-        return "Hier sind eure naechsten Termine:\n" + events, None
-    
-    elif intent == "create_task":
-        text = intent_data.get("text") or intent_data.get("title","Aufgabe")
-        deadline = intent_data.get("date")
-        if deadline:
-            try:
-                d = date.fromisoformat(deadline)
-                dt = tz.localize(datetime(d.year,d.month,d.day,0,0))
-            except:
-                dt = tz.localize(datetime(now.year,now.month,now.day,0,0))
-        else:
-            dt = tz.localize(datetime(now.year,now.month,now.day,0,0))
-        event = {
-            "summary": "✅ " + text,
-            "start": {"date": dt.strftime("%Y-%m-%d")},
-            "end": {"date": (dt + timedelta(days=1)).strftime("%Y-%m-%d")}
-        }
-        try:
-            service = get_calendar_service()
-            if service:
-                service.events().insert(calendarId=CALENDAR_ID,body=event).execute()
-                return "Aufgabe im Kalender eingetragen: ✅ " + text + " (" + dt.strftime("%d.%m.%Y") + ")", None
-        except Exception as e:
-            pass
-        return "Fehler beim Eintragen der Aufgabe!", None
-
-    elif intent == "create_list":
-        items = intent_data.get("items") or intent_data.get("text","Liste")
-        if isinstance(items, list):
-            items_str = ", ".join(items)
-        else:
-            items_str = str(items)
-        dt = tz.localize(datetime(now.year,now.month,now.day,0,0))
-        event = {
-            "summary": "🛒 " + items_str,
-            "start": {"date": dt.strftime("%Y-%m-%d")},
-            "end": {"date": (dt + timedelta(days=1)).strftime("%Y-%m-%d")}
-        }
-        try:
-            service = get_calendar_service()
-            if service:
-                service.events().insert(calendarId=CALENDAR_ID,body=event).execute()
-                return "Liste im Kalender eingetragen: 🛒 " + items_str, None
-        except Exception as e:
-            pass
-        return "Fehler beim Eintragen der Liste!", None
-
-    elif intent == "create_note":
-        text = intent_data.get("text","")
-        data_file = load_data()
-        if "notes" not in data_file:
-            data_file["notes"] = []
-        data_file["notes"].append({"text":text,"datum":now.strftime("%d.%m.%Y %H:%M")})
-        save_data(data_file)
-        return "Notiz gespeichert: " + text, None
-
-    elif intent in ["query_todos","query_events"]:
-        # Check if user asks for today, tomorrow or week
-        text_lower = intent_data.get("text","").lower()
-        if any(w in text_lower for w in ["heute","today","jetzt","now"]):
-            days = 1
-            label = "Heute"
-        elif any(w in text_lower for w in ["morgen","tomorrow"]):
-            days = 2
-            label = "Morgen"
-        elif any(w in text_lower for w in ["woche","week"]):
-            days = 7
-            label = "Diese Woche"
-        else:
-            days = 7
-            label = "Naechste Zeit"
-        events = get_upcoming_events(days)
-        return label + ":\n" + events, None
-    
-    elif intent == "send_briefing":
-        return "SEND_BRIEFING", None
-    else:
-        return None, None
+    return ("\n".join(results) if results else response),pending
 
 async def ask_gpt(user_message,user_id,context_data):
     tz=pytz.timezone(TIMEZONE)
@@ -426,19 +332,11 @@ async def ask_gpt(user_message,user_id,context_data):
     notes="\n".join([f"- {n['text']}" for n in context_data.get("notes",[])[-5:]])
     todos="\n".join([f"- {t['text']}" for t in context_data.get("todos",[])[-5:]])
     events=get_upcoming_events()
-    system=(
-        "Du bist ein KI-Assistent fuer ein Paar mit ADHS. "
-        "Antworte in der Sprache des Nutzers. Kurz und klar, max 3-4 Saetze. "
-        "Zeit: "+now_str+" Nutzer: "+user_name+"\n"
-        "Termine:\n"+events+"\n"
-        "Notizen:\n"+(notes if notes else "Keine")+"\n"
-        "Aufgaben:\n"+(todos if todos else "Keine")+"\n"
-        "WICHTIG: Wenn jemand Termine erstellen will, gib JEDEN Termin in einer eigenen Zeile aus. "
-        "Format fuer JEDEN Termin: KALENDER_TERMIN:Titel|YYYY-MM-DD HH:MM\n"
-        "Beispiel:\nKALENDER_TERMIN:Reformer Elevated|2026-05-14 10:00\n"
-        "KALENDER_TERMIN:Reformer Method|2026-05-14 11:15\n"
-        "Keine anderen Texte wenn Termine erstellt werden!"
-    )
+    system=("Du bist ein KI-Assistent fuer ein Paar mit ADHS. Antworte in der Sprache des Nutzers. Kurz und klar, max 3-4 Saetze. "
+        "Zeit: "+now_str+" Nutzer: "+user_name+"\nTermine:\n"+events+"\nNotizen:\n"+(notes if notes else "Keine")+
+        "\nAufgaben:\n"+(todos if todos else "Keine")+get_memory_context()+
+        "\nWICHTIG: Wenn jemand Termine erstellen will, gib JEDEN Termin in einer eigenen Zeile aus. "
+        "Format: KALENDER_TERMIN:Titel|YYYY-MM-DD HH:MM\nKeine anderen Texte wenn Termine erstellt werden!")
     messages=[{"role":"system","content":system}]
     for msg in context_data.get("conversation",[])[-10:]:
         messages.append(msg)
@@ -451,12 +349,84 @@ async def transcribe_voice(file_path):
         t=client.audio.transcriptions.create(model="whisper-1",file=f)
     return t.text
 
+# ── Morgen-Briefing ───────────────────────────────────────────────────────────
+async def generate_personal_briefing(user_id,user_name,lang="de"):
+    tz=pytz.timezone(TIMEZONE)
+    now=datetime.now(tz)
+    weekdays_de=["Montag","Dienstag","Mittwoch","Donnerstag","Freitag","Samstag","Sonntag"]
+    weekdays_en=["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    weekday=weekdays_de[now.weekday()] if lang=="de" else weekdays_en[now.weekday()]
+    events=get_upcoming_events(2)
+    memory_ctx=get_memory_context()
+    if lang=="de":
+        prompt=("Erstelle ein kurzes persoenliches Morgen-Briefing auf Deutsch fuer "+user_name+" (ADHS).\n"
+            "Heute: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nTermine:\n"+events+"\n"+memory_ctx+
+            "\nBriefing soll:\n- Mit 'Guten Morgen "+user_name+"!' beginnen\n- Heutigen Tag nennen\n"
+            "- Relevante Termine erwaehnen\n- Koordination mit Partner\n- Offene Aufgaben\n- Morgen kurz\n- Max 8 Zeilen")
+    else:
+        prompt=("Create a short personal morning briefing in English for "+user_name+" (ADHD).\n"
+            "Today: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nEvents:\n"+events+"\n"+memory_ctx+
+            "\nBriefing should:\n- Start with 'Good morning "+user_name+"!'\n- Mention today\n"
+            "- Relevant events\n- Coordination with partner\n- Open tasks\n- Brief look tomorrow\n- Max 8 lines")
+    response=client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":prompt}],max_tokens=300)
+    return response.choices[0].message.content
+
+async def generate_briefing(bot,target_user_id=None):
+    user_configs=[
+        {"id":"281391093","name":"Karsten","lang":"de"},
+        {"id":"934428072","name":"Kate","lang":"en"},
+    ]
+    for user in user_configs:
+        if target_user_id and user["id"]!=target_user_id:
+            continue
+        try:
+            briefing=await generate_personal_briefing(user["id"],user["name"],user["lang"])
+            await bot.send_message(chat_id=int(user["id"]),text=briefing)
+        except Exception as e:
+            logger.error(f"Briefing error for {user['name']}: {e}")
+
+async def evening_checkin(bot):
+    tz=pytz.timezone(TIMEZONE)
+    now=datetime.now(tz)
+    service=get_calendar_service()
+    if not service:
+        return
+    day_start=tz.localize(datetime(now.year,now.month,now.day,0,0))
+    day_end=tz.localize(datetime(now.year,now.month,now.day,23,59))
+    result=service.events().list(calendarId=CALENDAR_ID,timeMin=day_start.isoformat(),timeMax=day_end.isoformat(),singleEvents=True,orderBy="startTime").execute()
+    tasks=[e for e in result.get("items",[]) if e.get("summary","").startswith("✅")]
+    if not tasks:
+        return
+    msg="Guten Abend! 🌙 Kurzes Check-in:\n\n"
+    for i,t in enumerate(tasks,1):
+        msg+=f"{i}. {t.get('summary','').replace('✅ ','')}\n"
+    msg+="\nWas habt ihr erledigt? z.B. '1,3' oder 'alles' oder 'nichts'"
+    data=load_data()
+    chat_id=data.get("chat_id")
+    if chat_id:
+        try:
+            await bot.send_message(chat_id=int(chat_id),text=msg)
+        except:
+            pass
+
+async def scheduler(bot):
+    import asyncio
+    tz=pytz.timezone(TIMEZONE)
+    while True:
+        now=datetime.now(tz)
+        if now.hour==7 and now.minute==0:
+            await generate_briefing(bot)
+            await asyncio.sleep(61)
+        elif now.hour==20 and now.minute==0:
+            await evening_checkin(bot)
+            await asyncio.sleep(61)
+        else:
+            await asyncio.sleep(30)
+
 def is_allowed(update):
     return True
 
-JA_WORDS=["JA","YES","J","Y","YEP","YA","JO","SURE","OK","OKAY","DO IT","MACH ES","EINTRAGEN","ADD IT","GO","JETZT","NOW"]
-NEIN_WORDS=["NEIN","NO","CANCEL","ABBRECHEN","STOP","NOPE","NEE","NAH","NICHT","VERGISS ES","FORGET IT","SKIP","LASS ES"]
-
+# ── Handler ───────────────────────────────────────────────────────────────────
 async def handle_text(update,context):
     if not is_allowed(update):
         await update.message.reply_text("Kein Zugriff.")
@@ -464,39 +434,34 @@ async def handle_text(update,context):
     user_id=str(update.effective_user.id)
     text=update.message.text
     data=load_data()
-    pending=data.get("pending_event",None)
+    chat_id=str(update.effective_chat.id)
+    if data.get("chat_id")!=chat_id:
+        data["chat_id"]=chat_id
+        save_data(data)
+    pending=data.get("pending_event")
     if pending:
-        txt=text.strip().upper()
+        txt=text.strip().upper().replace("!","").replace(".","").strip()
         if any(txt==w or txt.startswith(w) for w in JA_WORDS):
             tz=pytz.timezone(TIMEZONE)
             dt=tz.localize(datetime.fromisoformat(pending["dt"]))
-            end_dt=dt+timedelta(hours=1)
-            ok=add_calendar_event(pending["title"],dt,end_dt)
+            ok=add_calendar_event(pending["title"],dt,dt+timedelta(hours=1))
             del data["pending_event"]
             save_data(data)
-            if ok:
-                await update.message.reply_text("Termin eingetragen: "+pending["title"]+" am "+dt.strftime("%d.%m.%Y um %H:%M Uhr"))
-            else:                
-                await update.message.reply_text("Fehler beim Eintragen!")
+            await update.message.reply_text("Termin eingetragen: "+pending["title"]+" am "+dt.strftime("%d.%m.%Y um %H:%M Uhr") if ok else "Fehler!")
             return
         elif ":" in text:
             try:
-                import re
                 time_match=re.search(r"(\d{1,2}:\d{2})",text)
                 if time_match:
                     old_dt=datetime.fromisoformat(pending["dt"])
-                    new_time=time_match.group(1).split(":")
-                    new_dt=old_dt.replace(hour=int(new_time[0]),minute=int(new_time[1]))
+                    h,m=time_match.group(1).split(":")
+                    new_dt=old_dt.replace(hour=int(h),minute=int(m))
                     tz=pytz.timezone(TIMEZONE)
                     new_dt=tz.localize(new_dt)
-                    end_dt=new_dt+timedelta(hours=1)
-                    ok=add_calendar_event(pending["title"],new_dt,end_dt)
+                    ok=add_calendar_event(pending["title"],new_dt,new_dt+timedelta(hours=1))
                     del data["pending_event"]
                     save_data(data)
-                    if ok:
-                        await update.message.reply_text("Termin eingetragen: "+pending["title"]+" am "+new_dt.strftime("%d.%m.%Y um %H:%M Uhr"))
-                    else:
-                        await update.message.reply_text("Fehler beim Eintragen!")
+                    await update.message.reply_text("Termin eingetragen: "+pending["title"]+" am "+new_dt.strftime("%d.%m.%Y um %H:%M Uhr") if ok else "Fehler!")
                     return
             except:
                 pass
@@ -505,27 +470,28 @@ async def handle_text(update,context):
             save_data(data)
             await update.message.reply_text("OK, Termin nicht eingetragen.")
             return
-    briefing_keywords = ["tagesplan","briefing","was steht an","was haben wir heute","morning briefing","mein tag"]
-    if any(kw in text.lower() for kw in briefing_keywords):
-        await generate_briefing(context.bot, target_user_id=user_id)
-        returnawait update.message.chat.send_action("typing")
-    intent_data = detect_intent(text, user_id, data)
-    intent = intent_data.get("intent","general")
-    pending = None
-    if intent in ["create_event","query_events","create_note","create_todo","query_todos"]:
-        result = execute_intent(intent_data, user_id, data)
-        if isinstance(result, tuple):
-            response, pending = result
+    if any(kw in text.lower() for kw in BRIEFING_KEYWORDS):
+        await generate_briefing(context.bot,target_user_id=user_id)
+        return
+    await update.message.chat.send_action("typing")
+    intent_data=detect_intent(text,user_id,data)
+    intent=intent_data.get("intent","general")
+    pending=None
+    if intent in ["create_event","create_task","create_list","create_note","query_events"]:
+        result=execute_intent(intent_data,user_id,data)
+        if isinstance(result,tuple):
+            response,pending=result
         else:
-            response = result
+            response=result
         if response is None:
-            response = await ask_gpt(text, user_id, data)
-            response, pending = process_calendar(response, data)
+            response=await ask_gpt(text,user_id,data)
+            response,pending=process_calendar(response,data)
     else:
-        response = await ask_gpt(text, user_id, data)
-        response, pending = process_calendar(response, data)
+        response=await ask_gpt(text,user_id,data)
+        response,pending=process_calendar(response,data)
     if pending:
-        data["pending_event"] = pending
+        data["pending_event"]=pending
+    update_memory_from_message(text,user_id,response)
     data["conversation"].append({"role":"user","content":text})
     data["conversation"].append({"role":"assistant","content":response})
     if len(data["conversation"])>20:
@@ -539,7 +505,7 @@ async def handle_voice(update,context):
         return
     user_id=str(update.effective_user.id)
     data=load_data()
-    pending=data.get("pending_event",None)
+    pending=data.get("pending_event")
     await update.message.chat.send_action("typing")
     voice=update.message.voice
     voice_file=await context.bot.get_file(voice.file_id)
@@ -551,30 +517,27 @@ async def handle_voice(update,context):
     user_name=USER_NAMES.get(user_id,"")
     await update.message.reply_text("Gehoert: "+(user_name+": " if user_name else "")+text)
     if pending:
-        txt_upper=text.strip().upper().replace("!","").replace(".","").strip()
-        if any(txt_upper==w or txt_upper.startswith(w) for w in JA_WORDS):
+        txt=text.strip().upper().replace("!","").replace(".","").strip()
+        if any(txt==w or txt.startswith(w) for w in JA_WORDS):
             tz=pytz.timezone(TIMEZONE)
             dt=tz.localize(datetime.fromisoformat(pending["dt"]))
-            end_dt=dt+timedelta(hours=1)
-            ok=add_calendar_event(pending["title"],dt,end_dt)
+            ok=add_calendar_event(pending["title"],dt,dt+timedelta(hours=1))
             del data["pending_event"]
             save_data(data)
-            msg="Termin eingetragen: "+pending["title"]+" am "+dt.strftime("%d.%m.%Y um %H:%M Uhr") if ok else "Fehler beim Eintragen!"
-            await update.message.reply_text(msg)
+            await update.message.reply_text("Termin eingetragen: "+pending["title"]+" am "+dt.strftime("%d.%m.%Y um %H:%M Uhr") if ok else "Fehler!")
             return
-        elif any(txt_upper==w or txt_upper.startswith(w) for w in NEIN_WORDS):
+        elif any(txt==w or txt.startswith(w) for w in NEIN_WORDS):
             del data["pending_event"]
             save_data(data)
             await update.message.reply_text("OK, Termin nicht eingetragen.")
             return
-    briefing_keywords=["tagesplan","briefing","was steht an","mein tag","morning briefing"]
-    if any(kw in text.lower() for kw in briefing_keywords):
+    if any(kw in text.lower() for kw in BRIEFING_KEYWORDS):
         await generate_briefing(context.bot,target_user_id=user_id)
         return
     intent_data=detect_intent(text,user_id,data)
     intent=intent_data.get("intent","general")
     pending=None
-    if intent in ["create_event","query_events","create_note","create_todo","query_todos","create_task","create_list"]:
+    if intent in ["create_event","create_task","create_list","create_note","query_events"]:
         result=execute_intent(intent_data,user_id,data)
         if isinstance(result,tuple):
             response,pending=result
@@ -600,124 +563,19 @@ async def start(update,context):
     user_id=str(update.effective_user.id)
     user_name=USER_NAMES.get(user_id,"")
     name_str=", "+user_name if user_name else ""
-    await update.message.reply_text(
-        "Hallo"+name_str+"! Ich bin euer Assistent.\n"
-        "Deine ID: "+user_id+"\n"
-        "Schreib mir oder schick eine Sprachnachricht!"
-    )
-
-
-# ── Morgen-Briefing ───────────────────────────────────────────────────────────
-async def generate_briefing(bot):
-    tz = pytz.timezone(TIMEZONE)
-    now = datetime.now(tz)
-    weekdays_de = ["Montag","Dienstag","Mittwoch","Donnerstag","Freitag","Samstag","Sonntag"]
-    weekday = weekdays_de[now.weekday()]
-    
-    events = get_upcoming_events(2)
-    memory_ctx = get_memory_context()
-    
-    prompt = (
-        "Du bist ein persoenlicher Assistent fuer ein Paar mit ADHS. "
-        "Erstelle ein kurzes, freundliches Morgen-Briefing auf Deutsch. "
-        "Heute ist " + weekday + " " + now.strftime("%d.%m.%Y") + ".\n"
-        "Termine heute und morgen:\n" + events + "\n"
-        + memory_ctx +
-        "\nDas Briefing soll:\n"
-        "- Mit Guten Morgen beginnen\n"
-        "- Heutigen Tag und Datum nennen\n"
-        "- Wichtige Termine heute erwaehnen\n"
-        "- An offene Aufgaben erinnern\n"
-        "- Morgen kurz vorausschauen\n"
-        "- Max 8 Zeilen, klar und strukturiert\n"
-        "- Emojis sparsam nutzen\n"
-        "Kein langer Text - kurz und praktisch!"
-    )
-    
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role":"user","content":prompt}],
-        max_tokens=300
-    )
-    
-    briefing = response.choices[0].message.content
-    
-    # Send to group - use the chat IDs from ALLOWED_USERS
-    for user_id in ALLOWED_USERS:
-        if user_id.strip():
-            try:
-                await bot.send_message(chat_id=int(user_id.strip()), text=briefing)
-                break  # Send once to first user, they are in same group
-            except:
-                pass
-
-async def evening_checkin(bot):
-    tz = pytz.timezone(TIMEZONE)
-    now = datetime.now(tz)
-    
-    # Get todays calendar events
-    service = get_calendar_service()
-    if not service:
-        return
-    
-    day_start = tz.localize(datetime(now.year,now.month,now.day,0,0))
-    day_end = tz.localize(datetime(now.year,now.month,now.day,23,59))
-    
-    result = service.events().list(
-        calendarId=CALENDAR_ID,
-        timeMin=day_start.isoformat(),
-        timeMax=day_end.isoformat(),
-        singleEvents=True,
-        orderBy="startTime"
-    ).execute()
-    
-    events = result.get("items",[])
-    tasks = [e for e in events if e.get("summary","").startswith("✅")]
-    
-    if not tasks:
-        return
-    
-    msg = "Guten Abend! 🌙 Kurzes Check-in:\n\n"
-    for i, t in enumerate(tasks, 1):
-        msg += f"{i}. {t.get('summary','').replace('✅ ','')}\n"
-    msg += "\nWas habt ihr heute erledigt? Antwortet mit den Nummern z.B. '1,3' oder 'alles' oder 'nichts'"
-    
-    for user_id in ALLOWED_USERS:
-        if user_id.strip():
-            try:
-                await bot.send_message(chat_id=int(user_id.strip()), text=msg)
-                break
-            except:
-                pass
-
-async def scheduler(bot):
-    import asyncio
-    tz = pytz.timezone(TIMEZONE)
-    while True:
-        now = datetime.now(tz)
-        # Morning briefing at 8:00
-        if now.hour == 7 and now.minute == 0:
-            await generate_briefing(bot)
-            await asyncio.sleep(61)
-        # Evening check-in at 20:00
-        elif now.hour == 20 and now.minute == 0:
-            await evening_checkin(bot)
-            await asyncio.sleep(61)
-        else:
-            await asyncio.sleep(30)
+    await update.message.reply_text("Hallo"+name_str+"! Ich bin euer Assistent.\nDeine ID: "+user_id+"\nSchreib mir oder schick eine Sprachnachricht!")
 
 def main():
+    import asyncio
     app=ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    async def post_init(application):
+        asyncio.create_task(scheduler(application.bot))
+    app.post_init=post_init
     app.add_handler(CommandHandler("start",start))
     app.add_handler(MessageHandler(filters.VOICE,handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_text))
-    import asyncio
-    async def post_init(application):
-        asyncio.create_task(scheduler(application.bot))
-    app.post_init = post_init
     print("Agent laeuft!")
     app.run_polling()
 
 if __name__=="__main__":
     main()
-    
