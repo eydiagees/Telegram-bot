@@ -387,14 +387,26 @@ async def generate_personal_briefing(user_id,user_name,lang="de"):
     memory_ctx=get_memory_context()
     if lang=="de":
         prompt=("Erstelle ein kurzes persoenliches Morgen-Briefing auf Deutsch fuer "+user_name+" (ADHS).\n"
-            "Heute: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nTermine:\n"+events+"\n"+memory_ctx+
-            "\nBriefing soll:\n- Mit 'Guten Morgen "+user_name+"!' beginnen\n- Heutigen Tag nennen\n"
-            "- Relevante Termine erwaehnen\n- Koordination mit Partner\n- Offene Aufgaben\n- Morgen kurz\n- Max 8 Zeilen")
+            "Heute: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nAlle Termine:\n"+events+"\n"+memory_ctx+
+            "\nWICHTIG: Unterscheide klar zwischen:\n"
+            "- "+user_name+"s eigene Termine/Aufgaben (✅ und Termine ohne Emoji die fuer ihn sind)\n"
+            "- Gemeinsame Termine (beide betroffen)\n"
+            "- Partner-Termine die "+user_name+" kennen sollte zur Koordination\n"
+            "Aufgaben mit ✅ die fuer den Partner sind NUR kurz erwaehnen zur Info.\n"
+            "Briefing soll:\n- Mit 'Guten Morgen "+user_name+"!' beginnen\n"
+            "- Eigene Termine zuerst\n- Gemeinsame Termine\n"
+            "- Partner-Info kurz\n- Offene eigene Aufgaben\n- Max 8 Zeilen")
     else:
         prompt=("Create a short personal morning briefing in English for "+user_name+" (ADHD).\n"
-            "Today: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nEvents:\n"+events+"\n"+memory_ctx+
-            "\nBriefing should:\n- Start with 'Good morning "+user_name+"!'\n- Mention today\n"
-            "- Relevant events\n- Coordination with partner\n- Open tasks\n- Brief look tomorrow\n- Max 8 lines")
+            "Today: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nAll events:\n"+events+"\n"+memory_ctx+
+            "\nIMPORTANT: Clearly distinguish between:\n"
+            "- "+user_name+"'s own events/tasks (her Reformer classes, her tasks)\n"
+            "- Shared events (both affected)\n"
+            "- Partner's events "+user_name+" should know for coordination\n"
+            "Tasks with ✅ that belong to the partner should only be briefly mentioned.\n"
+            "Briefing should:\n- Start with 'Good morning "+user_name+"!'\n"
+            "- Own events first\n- Shared events\n"
+            "- Partner info briefly\n- Open own tasks\n- Max 8 lines")
     response=client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":prompt}],max_tokens=300)
     return response.choices[0].message.content
 
