@@ -188,7 +188,7 @@ Nutzer: """+user_name+"\nNachricht: "+user_message+"\nAntwort: "+gpt_response
         pass
 
 # ── Intent Engine ─────────────────────────────────────────────────────────────
-INTENT_SYSTEM="""Du bist ein Intent-Erkennungs-System. Analysiere die Nachricht und gib NUR JSON zurueck.
+INTENT_SYSTEM="""Du bist ein Intent-Erkennungs-System. Analysiere die Nachricht und gib NUR ein JSON-Array zurueck.
 Karsten (ID: 281391093) spricht Deutsch. Kate (ID: 934428072) spricht Englisch.
 
 Intents:
@@ -201,7 +201,34 @@ Intents:
 
 Affects: "self"=nur Schreiber, "partner"=nur Partner, "both"=beide
 
-Format: {"intent":"create_event","title":"...","date":"YYYY-MM-DD","time":"HH:MM","duration_hours":1,"allday":false,"affects":"self","text":"...","items":[]}"""
+Format (IMMER ein Array):
+[
+  {"intent":"create_event","title":"...","date":"YYYY-MM-DD","time":"HH:MM","duration_hours":1,"affects":"self"},
+  {"intent":"create_task","title":"...","date":null,"affects":"self"},
+  {"intent":"create_list","items":["item1","item2"],"affects":"self"},
+  {"intent":"create_note","text":"...","affects":"self"},
+  {"intent":"general","text":"..."}
+]
+Beispiel "Anzughose gerissen, Chili-Oel kaufen":
+[{"intent":"create_task","title":"Anzughose Ersatz","date":null,"affects":"self"},{"intent":"create_list","items":["Chili-Oel"],"affects":"self"}]"""
+
+def detect_intents(user_message,user_id,context_data):
+    tz=pytz.timezone(TIMEZONE)
+    now_str=datetime.now(tz).strftime("%d.%m.%Y %H:%M")
+    user_name=USER_NAMES.get(user_id,"")
+    user_info=USERS.get(user_id,{})
+    partner_id=user_info.get("partner_id","")
+    partner_name=USER_NAMES.get(partner_id,"Partner")
+    prompt=INTENT_SYSTEM+"\n\nZeit: "+now_str+"\nSchreiber: "+user_name+"\nPartner: "+partner_name+"\nNachricht: "+user_message
+    try:
+        response=client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":prompt}],max_tokens=500)
+        text=response.choices[0].message.content.strip()
+        match=re.search(r'\[.*\]',text,re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        return [{"intent":"general","text":user_message}]
+    except:
+        return [{"intent":"general","text":user_message}]
 
 def detect_intent(user_message,user_id,context_data):
     tz=pytz.timezone(TIMEZONE)
@@ -409,12 +436,64 @@ async def evening_checkin(bot):
         except:
             pass
 
+async def analyze_notes(bot):
+    data=load_data()
+    notes=data.get("notes",[])
+    if not notes:
+        return
+    unprocessed=[n for n in notes if not n.get("processed")]
+    if not unprocessed:
+        return
+    notes_text="\n".join([f"- {n['datum']}: {n['text']}" for n in unprocessed])
+    prompt="""Analysiere diese Notizen und leite daraus Aufgaben ab. Gib NUR JSON Array zurueck.
+Format: [{"type":"task","title":"...","date":"YYYY-MM-DD oder null"},{"type":"info","text":"..."}]
+Notizen:
+"""+notes_text
+    try:
+        response=client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":prompt}],max_tokens=400,response_format={"type":"json_object"})
+        result=json.loads(response.choices[0].message.content)
+        actions=result if isinstance(result,list) else result.get("actions",[])
+        tz=pytz.timezone(TIMEZONE)
+        now=datetime.now(tz)
+        added=[]
+        for action in actions:
+            if action.get("type")=="task":
+                title=action.get("title","")
+                date_str=action.get("date")
+                if date_str:
+                    try:
+                        d=date.fromisoformat(date_str)
+                        dt=datetime(d.year,d.month,d.day)
+                    except:
+                        dt=now
+                else:
+                    dt=now
+                ok=add_allday_event("✅ "+title,dt)
+                if ok:
+                    added.append(title)
+        for n in unprocessed:
+            n["processed"]=True
+        data["notes"]=notes
+        save_data(data)
+        if added:
+            msg="📋 Aus euren Notizen habe ich folgende Aufgaben abgeleitet:\n"
+            msg+="\n".join(["- ✅ "+a for a in added])
+            data2=load_data()
+            chat_id=data2.get("chat_id")
+            if chat_id:
+                await bot.send_message(chat_id=int(chat_id),text=msg)
+    except Exception as e:
+        logger.error(f"analyze_notes error: {e}")
+
 async def scheduler(bot):
     import asyncio
     tz=pytz.timezone(TIMEZONE)
     while True:
         now=datetime.now(tz)
-        if now.hour==7 and now.minute==0:
+        if now.hour==6 and now.minute==50:
+            await analyze_notes(bot)
+            await asyncio.sleep(61)
+        elif now.hour==7 and now.minute==0:
             await generate_briefing(bot)
             await asyncio.sleep(61)
         elif now.hour==20 and now.minute==0:
@@ -474,16 +553,25 @@ async def handle_text(update,context):
         await generate_briefing(context.bot,target_user_id=user_id)
         return
     await update.message.chat.send_action("typing")
-    intent_data=detect_intent(text,user_id,data)
-    intent=intent_data.get("intent","general")
+    intents=detect_intents(text,user_id,data)
+    results=[]
     pending=None
-    if intent in ["create_event","create_task","create_list","create_note","query_events"]:
-        result=execute_intent(intent_data,user_id,data)
-        if isinstance(result,tuple):
-            response,pending=result
-        else:
-            response=result
-        if response is None:
+    has_action=any(i.get("intent") in ["create_event","create_task","create_list","create_note","query_events"] for i in intents)
+    if has_action:
+        for intent_data in intents:
+            intent=intent_data.get("intent","general")
+            if intent in ["create_event","create_task","create_list","create_note","query_events"]:
+                result=execute_intent(intent_data,user_id,data)
+                if isinstance(result,tuple):
+                    r,p=result
+                    if p:
+                        pending=p
+                else:
+                    r=result
+                if r:
+                    results.append(r)
+        response="\n".join(results) if results else None
+        if not response:
             response=await ask_gpt(text,user_id,data)
             response,pending=process_calendar(response,data)
     else:
