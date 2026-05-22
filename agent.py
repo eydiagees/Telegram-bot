@@ -659,6 +659,60 @@ async def handle_voice(update,context):
     save_data(data)
     await update.message.reply_text(response)
 
+
+async def handle_photo(update,context):
+    if not is_allowed(update):
+        await update.message.reply_text("Kein Zugriff.")
+        return
+    user_id=str(update.effective_user.id)
+    data=load_data()
+    await update.message.chat.send_action("typing")
+    photo=update.message.photo[-1]
+    photo_file=await context.bot.get_file(photo.file_id)
+    with tempfile.NamedTemporaryFile(suffix=".jpg",delete=False) as tmp:
+        tmp_path=tmp.name
+    await photo_file.download_to_drive(tmp_path)
+    with open(tmp_path,"rb") as f:
+        import base64
+        image_data=base64.b64encode(f.read()).decode("utf-8")
+    os.unlink(tmp_path)
+    caption=update.message.caption or ""
+    user_name=USER_NAMES.get(user_id,"")
+    tz=pytz.timezone(TIMEZONE)
+    now_str=datetime.now(tz).strftime("%d.%m.%Y %H:%M")
+    system_prompt=(
+        "Du bist ein KI-Assistent fuer ein Paar mit ADHS. "
+        "Analysiere dieses Bild und extrahiere alle relevanten Informationen. "
+        "Zeit: "+now_str+" Nutzer: "+user_name+"\n"
+        "Suche nach: Terminen, Aufgaben, Einkaufslistens, wichtigen Infos.\n"
+        "Gib eine kurze Zusammenfassung und frage ob du Aktionen durchfuehren sollst.\n"
+        "Antworte in der Sprache des Nutzers."
+    )
+    if caption:
+        system_prompt+="\nNutzer-Kommentar zum Bild: "+caption
+    try:
+        response=client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role":"user",
+                "content":[
+                    {"type":"text","text":system_prompt},
+                    {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"+image_data}}
+                ]
+            }],
+            max_tokens=500
+        )
+        reply=response.choices[0].message.content
+        update_memory_from_message("Foto analysiert: "+reply,user_id,reply)
+        data["conversation"].append({"role":"user","content":"[Foto] "+caption})
+        data["conversation"].append({"role":"assistant","content":reply})
+        if len(data["conversation"])>20:
+            data["conversation"]=data["conversation"][-20:]
+        save_data(data)
+        await update.message.reply_text(reply)
+    except Exception as e:
+        await update.message.reply_text("Fehler beim Analysieren des Fotos: "+str(e))
+
 async def start(update,context):
     user_id=str(update.effective_user.id)
     user_name=USER_NAMES.get(user_id,"")
@@ -673,6 +727,7 @@ def main():
     app.post_init=post_init
     app.add_handler(CommandHandler("start",start))
     app.add_handler(MessageHandler(filters.VOICE,handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO,handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_text))
     print("Agent laeuft!")
     app.run_polling()
