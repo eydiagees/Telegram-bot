@@ -192,6 +192,218 @@ Nutzer: """+user_name+"\nNachricht: "+user_message+"\nAntwort: "+gpt_response
     except:
         pass
 
+# ── Kontext-System ───────────────────────────────────────────────────────────
+# Regelplan: Wer ist wann verfuegbar / verantwortlich
+DEFAULT_SCHEDULE={
+    "karsten":{
+        "work_days":["mo","di","mi","do","fr"],
+        "work_hours":"9-18",
+        "childcare_default": False,   # Karsten ist im Buero -> kann Marlene nicht abholen
+    },
+    "kate":{
+        "teaching_days":["donnerstag","sonntag"],
+        "teaching_hours":"10-13",
+        "childcare_default": True,    # Kate ist normalerweise fuer Marlene zustaendig
+    },
+    "marlene":{
+        "kita_start":"9:30",
+        "kita_end":"16:00",
+        "pickup_default":"kate",      # Wer holt normalerweise ab
+        "kita_days":["mo","di","mi","do","fr"],
+    }
+}
+
+def get_context(data=None):
+    """Gibt den aktuellen dynamischen Kontext zurueck."""
+    if data is None:
+        data=load_data()
+    return data.get("context",{"current":{},"schedule":{}})
+
+def save_context(ctx,data=None):
+    if data is None:
+        data=load_data()
+    data["context"]=ctx
+    save_data(data)
+
+def get_childcare_situation(data=None):
+    """
+    Analysiert den aktuellen Kontext und gibt zurueck wer Marlene betreut.
+    Wenn Karsten auf Reise oder Buero -> Kate muss Kita-Pickup uebernehmen.
+    Wenn Kate unterrichtet UND Karsten weg -> Problem, flaggen.
+    """
+    if data is None:
+        data=load_data()
+    ctx=get_context(data)
+    current=ctx.get("current",{})
+    tz=pytz.timezone(TIMEZONE)
+    now=datetime.now(tz)
+    today_str=now.strftime("%Y-%m-%d")
+
+    karsten_away=False
+    kate_teaching=False
+    karsten_status=""
+
+    # Pruefen ob Karsten abwesend (Reise, Urlaub, etc.)
+    k_ctx=current.get("karsten",{})
+    if k_ctx:
+        status=k_ctx.get("status","")
+        until=k_ctx.get("until","")
+        if status in ["geschaeftsreise","reise","urlaub","abwesend","dienstreise"]:
+            # Pruefen ob 'until' noch in der Zukunft liegt
+            if until:
+                try:
+                    # until kann "03.06" oder "2026-06-03" sein
+                    if len(until)==5:  # "03.06"
+                        d,m=until.split(".")
+                        until_dt=tz.localize(datetime(now.year,int(m),int(d)))
+                    elif len(until)==10:  # "2026-06-03"
+                        until_dt=tz.localize(datetime.fromisoformat(until))
+                    else:
+                        until_dt=now+timedelta(days=1)
+                    if now<=until_dt+timedelta(days=1):
+                        karsten_away=True
+                        karsten_status=status
+                except:
+                    karsten_away=True
+                    karsten_status=status
+            else:
+                karsten_away=True
+                karsten_status=status
+
+    # Pruefen ob Kate heute unterrichtet
+    weekday_map={"mo":0,"di":1,"mi":2,"do":3,"fr":4,"sa":5,"so":6,
+                 "montag":0,"dienstag":1,"mittwoch":2,"donnerstag":3,"freitag":4,"samstag":5,"sonntag":6}
+    kate_teaching_days=DEFAULT_SCHEDULE["kate"]["teaching_days"]
+    today_wd=now.weekday()
+    for td in kate_teaching_days:
+        if weekday_map.get(td.lower(),99)==today_wd:
+            kate_teaching=True
+            break
+
+    result={
+        "karsten_away":karsten_away,
+        "karsten_status":karsten_status,
+        "kate_teaching_today":kate_teaching,
+        "pickup_person":"kate",  # default
+        "conflict":False,
+        "conflict_reason":"",
+    }
+    if karsten_away:
+        result["pickup_person"]="kate"
+        if kate_teaching:
+            result["conflict"]=True
+            result["conflict_reason"]="Karsten ist "+karsten_status+" und Kate unterrichtet heute – wer holt Marlene ab?"
+    return result
+
+def get_context_summary(data=None):
+    """Gibt einen kurzen Kontext-String fuer GPT-Prompts zurueck."""
+    if data is None:
+        data=load_data()
+    ctx=get_context(data)
+    current=ctx.get("current",{})
+    lines=[]
+
+    for person,info in current.items():
+        if info:
+            status=info.get("status","")
+            until=info.get("until","")
+            note=info.get("note","")
+            name=person.capitalize()
+            line=f"- {name}: {status}"
+            if until:
+                line+=f" bis {until}"
+            if note:
+                line+=f" ({note})"
+            lines.append(line)
+
+    childcare=get_childcare_situation(data)
+    if childcare["karsten_away"]:
+        lines.append(f"- Karsten abwesend ({childcare['karsten_status']}) → Kate ist fuer Marlene/Kita zustaendig")
+    if childcare["conflict"]:
+        lines.append(f"⚠️ KONFLIKT: {childcare['conflict_reason']}")
+
+    if not lines:
+        return ""
+    return "\nAktueller Kontext:\n"+"\n".join(lines)+"\n"
+
+def update_context_from_message(user_message,user_id,data=None):
+    """
+    Erkennt automatisch Kontextaenderungen aus Nachrichten.
+    z.B. 'Ich bin ab Montag auf Geschaeftsreise bis Freitag' -> speichert Kontext fuer Karsten.
+    """
+    if data is None:
+        data=load_data()
+    user_name=USER_NAMES.get(user_id,"").lower()
+    tz=pytz.timezone(TIMEZONE)
+    now=datetime.now(tz)
+
+    extract_prompt="""Analysiere die Nachricht auf Kontextaenderungen (Abwesenheiten, Reisen, Urlaub, Homeoffice, besondere Situationen).
+Gib NUR JSON zurueck oder {}.
+Format: {"person":"karsten/kate","status":"geschaeftsreise/urlaub/homeoffice/krank/normal","from":"YYYY-MM-DD","until":"YYYY-MM-DD","note":"..."}
+Nur besetzen wenn eine echte Kontextaenderung erkannt wird. Sonst: {}
+Heute: """+now.strftime("%Y-%m-%d")+"\nSchreiber: "+user_name+"\nNachricht: "+user_message
+    try:
+        response=client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role":"user","content":extract_prompt}],
+            max_tokens=200,
+            response_format={"type":"json_object"}
+        )
+        extracted=json.loads(response.choices[0].message.content)
+        if not extracted or "person" not in extracted:
+            return
+        person=extracted.get("person","")
+        if person not in ["karsten","kate"]:
+            return
+        ctx=get_context(data)
+        if "current" not in ctx:
+            ctx["current"]={}
+        ctx["current"][person]={
+            "status":extracted.get("status",""),
+            "from":extracted.get("from",""),
+            "until":extracted.get("until",""),
+            "note":extracted.get("note",""),
+            "updated":now.strftime("%Y-%m-%d %H:%M"),
+        }
+        save_context(ctx,data)
+
+        # Wenn Karsten weg ist: Kate proaktiv informieren
+        if person=="karsten" and extracted.get("status") in ["geschaeftsreise","reise","urlaub","abwesend","dienstreise"]:
+            childcare=get_childcare_situation(data)
+            if childcare.get("conflict"):
+                return "⚠️ "+childcare["conflict_reason"]
+        return None
+    except:
+        return None
+
+async def notify_partner_if_needed(bot,user_id,context_change_msg,data=None):
+    """Benachrichtigt den Partner wenn ein relevanter Kontext erkannt wurde."""
+    if not context_change_msg:
+        return
+    user_info=USERS.get(user_id,{})
+    partner_id=user_info.get("partner_id","")
+    if not partner_id:
+        return
+    partner_lang=USERS.get(partner_id,{}).get("lang","de")
+    childcare=get_childcare_situation(data)
+
+    if partner_lang=="en":
+        msg="📋 FYI: "+context_change_msg
+        if childcare.get("karsten_away"):
+            msg+="\n\nThis means you're responsible for Marlene's kindergarten pickup (by 16:00)."
+        if childcare.get("conflict"):
+            msg+="\n\n⚠️ "+childcare["conflict_reason"]
+    else:
+        msg="📋 Info: "+context_change_msg
+        if childcare.get("karsten_away"):
+            msg+="\n\nDas bedeutet: Du bist fuer Marlenes Kita-Abholung zustaendig (bis 16:00 Uhr)."
+        if childcare.get("conflict"):
+            msg+="\n\n⚠️ "+childcare["conflict_reason"]
+    try:
+        await bot.send_message(chat_id=int(partner_id),text=msg)
+    except Exception as e:
+        logger.error(f"Partner notify error: {e}")
+
 # ── Intent Engine ─────────────────────────────────────────────────────────────
 INTENT_SYSTEM="""Du bist ein Intent-Erkennungs-System. Analysiere die Nachricht und gib NUR JSON zurueck.
 Karsten (ID: 281391093) spricht Deutsch. Kate (ID: 934428072) spricht Englisch.
@@ -371,9 +583,16 @@ async def ask_gpt(user_message,user_id,context_data):
     notes="\n".join([f"- {n['text']}" for n in context_data.get("notes",[])[-5:]])
     todos="\n".join([f"- {t['text']}" for t in context_data.get("todos",[])[-5:]])
     events=get_upcoming_events()
+    context_summary=get_context_summary(context_data)
+    childcare=get_childcare_situation(context_data)
+    childcare_note=""
+    if childcare["karsten_away"]:
+        childcare_note="\nWICHTIG: Karsten ist "+childcare["karsten_status"]+" – Kate ist fuer Marlenes Kita-Abholung (bis 16:00) zustaendig!"
+    if childcare["conflict"]:
+        childcare_note+="\n\u26a0\ufe0f KONFLIKT: "+childcare["conflict_reason"]
     system=("Du bist ein KI-Assistent fuer ein Paar mit ADHS. Antworte in der Sprache des Nutzers. Kurz und klar, max 3-4 Saetze. "
         "Zeit: "+now_str+" Nutzer: "+user_name+"\nTermine:\n"+events+"\nNotizen:\n"+(notes if notes else "Keine")+
-        "\nAufgaben:\n"+(todos if todos else "Keine")+get_memory_context()+
+        "\nAufgaben:\n"+(todos if todos else "Keine")+get_memory_context()+context_summary+childcare_note+
         "\nWICHTIG: Wenn jemand Termine erstellen will, gib JEDEN Termin in einer eigenen Zeile aus. "
         "Format: KALENDER_TERMIN:Titel|YYYY-MM-DD HH:MM\nKeine anderen Texte wenn Termine erstellt werden!")
     messages=[{"role":"system","content":system}]
@@ -397,16 +616,27 @@ async def generate_personal_briefing(user_id,user_name,lang="de"):
     weekday=weekdays_de[now.weekday()] if lang=="de" else weekdays_en[now.weekday()]
     events=get_upcoming_events(2)
     memory_ctx=get_memory_context()
+    data=load_data()
+    ctx_summary=get_context_summary(data)
+    childcare=get_childcare_situation(data)
+    childcare_briefing=""
+    if childcare["karsten_away"]:
+        if lang=="de":
+            childcare_briefing="\n\u26a0\ufe0f Karsten ist "+childcare["karsten_status"]+" – du bist heute fuer Marlenes Kita-Abholung zustaendig (bis 16:00 Uhr)!"
+        else:
+            childcare_briefing="\n\u26a0\ufe0f Karsten is "+childcare["karsten_status"]+" – you are responsible for Marlene's kindergarten pickup today (by 16:00)!"
+    if childcare["conflict"]:
+        childcare_briefing+="\n\u26a0\ufe0f "+childcare["conflict_reason"]
     if lang=="de":
         prompt=("Erstelle ein kurzes persoenliches Morgen-Briefing auf Deutsch fuer "+user_name+" (ADHS).\n"
-            "Heute: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nTermine:\n"+events+"\n"+memory_ctx+
+            "Heute: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nTermine:\n"+events+"\n"+memory_ctx+ctx_summary+childcare_briefing+
             "\nBriefing soll:\n- Mit 'Guten Morgen "+user_name+"!' beginnen\n- Heutigen Tag nennen\n"
-            "- Relevante Termine erwaehnen\n- Koordination mit Partner\n- Offene Aufgaben\n- Morgen kurz\n- Max 8 Zeilen")
+            "- Relevante Termine erwaehnen\n- Kita/Betreuung erwaehnen wenn relevant\n- Koordination mit Partner\n- Offene Aufgaben\n- Morgen kurz\n- Max 8 Zeilen")
     else:
         prompt=("Create a short personal morning briefing in English for "+user_name+" (ADHD).\n"
-            "Today: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nEvents:\n"+events+"\n"+memory_ctx+
+            "Today: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nEvents:\n"+events+"\n"+memory_ctx+ctx_summary+childcare_briefing+
             "\nBriefing should:\n- Start with 'Good morning "+user_name+"!'\n- Mention today\n"
-            "- Relevant events\n- Coordination with partner\n- Open tasks\n- Brief look tomorrow\n- Max 8 lines")
+            "- Relevant events\n- Mention childcare if relevant\n- Coordination with partner\n- Open tasks\n- Brief look tomorrow\n- Max 8 lines")
     response=client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":prompt}],max_tokens=300)
     return response.choices[0].message.content
 
@@ -531,12 +761,14 @@ async def handle_text(update,context):
     if pending:
         data["pending_event"]=pending
     update_memory_from_message(text,user_id,response)
+    ctx_change=update_context_from_message(text,user_id,data)
     data["conversation"].append({"role":"user","content":text})
     data["conversation"].append({"role":"assistant","content":response})
     if len(data["conversation"])>20:
         data["conversation"]=data["conversation"][-20:]
     save_data(data)
     await update.message.reply_text(response)
+    await notify_partner_if_needed(context.bot,user_id,ctx_change,data)
 
 async def handle_voice(update,context):
     if not is_allowed(update):
@@ -591,12 +823,14 @@ async def handle_voice(update,context):
     if pending:
         data["pending_event"]=pending
     update_memory_from_message(text,user_id,response)
+    ctx_change=update_context_from_message(text,user_id,data)
     data["conversation"].append({"role":"user","content":text})
     data["conversation"].append({"role":"assistant","content":response})
     if len(data["conversation"])>20:
         data["conversation"]=data["conversation"][-20:]
     save_data(data)
     await update.message.reply_text(response)
+    await notify_partner_if_needed(context.bot,user_id,ctx_change,data)
 
 async def start(update,context):
     user_id=str(update.effective_user.id)
