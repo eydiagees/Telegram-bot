@@ -369,10 +369,10 @@ def execute_intent(intent_data,user_id,context_data):
         title=intent_data.get("title","Termin")
         date_str=intent_data.get("date")
         time_str=intent_data.get("time","09:00")
-        duration=intent_data.get("duration_hours",1)
+        duration=intent_data.get("duration_hours") or 1
         if not date_str:
             return "Ich brauche noch ein Datum. Wann soll der Termin stattfinden?",None
-        if not time_str:
+        if not time_str or time_str=="null":
             time_str="09:00"
         try:
             dt=tz.localize(datetime.strptime(date_str+" "+time_str,"%Y-%m-%d %H:%M"))
