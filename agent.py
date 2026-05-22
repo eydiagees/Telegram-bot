@@ -414,6 +414,9 @@ Intents:
 - create_list: Einkaufsliste -> ganztaegig mit 🛒
 - create_note: Kurze Notiz
 - query_events: Termine abfragen
+- complete_task: Aufgabe als erledigt markieren (z.B. "erledigt", "done", "habe X gemacht", "fertig mit X")
+- assign_task: Aufgabe jemandem zuweisen (z.B. "X macht Y", "Y ist fuer Kate", "Karsten uebernimmt Z")
+- query_tasks: Offene Aufgaben anzeigen (z.B. "was steht noch aus", "offene todos", "open tasks")
 - general: Alles andere
 
 WICHTIG fuer Reisen/Urlaub/Abwesenheiten:
@@ -525,6 +528,54 @@ def execute_intent(intent_data,user_id,context_data):
         else:
             days,label=7,"Naechste 7 Tage"
         return label+":\n"+get_upcoming_events(days),None
+
+    elif intent=="query_tasks":
+        tasks=get_open_tasks(days_back=30)
+        if not tasks:
+            return ("Keine offenen Aufgaben! 🎉" if "de"==USERS.get(user_id,{}).get("lang") else "No open tasks! 🎉"),None
+        lines=[]
+        for i,t in enumerate(tasks,1):
+            assignee=" → "+t["assignee"] if t["assignee"] else ""
+            overdue=" ⚠️" if t["date"]<now.strftime("%Y-%m-%d") else ""
+            lines.append(str(i)+". "+t["title"]+assignee+overdue)
+        return "\n".join(lines),None
+
+    elif intent=="complete_task":
+        title_hint=intent_data.get("title","") or intent_data.get("text","")
+        tasks=get_open_tasks(days_back=30)
+        if not tasks:
+            return "Keine offenen Aufgaben gefunden.",None
+        # Fuzzy match: find best matching task
+        matched=None
+        for t in tasks:
+            if title_hint.lower() in t["title"].lower() or t["title"].lower() in title_hint.lower():
+                matched=t
+                break
+        if not matched and tasks:
+            # Try to match by number in text
+            nums=re.findall(r"\d+",title_hint)
+            if nums:
+                idx=int(nums[0])-1
+                if 0<=idx<len(tasks):
+                    matched=tasks[idx]
+        if matched:
+            ok=complete_task(matched["id"],matched["title"])
+            return ("✅✅ Erledigt: "+matched["title"] if ok else "Fehler beim Abhaken!"),None
+        return "Welche Aufgabe meinst du? Schreib z.B. 'erledigt: "+tasks[0]["title"]+"'",None
+
+    elif intent=="assign_task":
+        title_hint=intent_data.get("title","") or intent_data.get("text","")
+        assignee=intent_data.get("assignee","")
+        tasks=get_open_tasks(days_back=30)
+        matched=None
+        for t in tasks:
+            if title_hint.lower() in t["title"].lower():
+                matched=t
+                break
+        if matched and assignee:
+            ok=assign_task(matched["id"],matched["title"],assignee)
+            return ("📌 "+matched["title"]+" → "+assignee if ok else "Fehler!"),None
+        return "Bitte sag mir welche Aufgabe und wer sie übernimmt.",None
 
     return None,None
 
@@ -654,29 +705,203 @@ async def generate_briefing(bot,target_user_id=None):
         except Exception as e:
             logger.error(f"Briefing error for {user['name']}: {e}")
 
-async def evening_checkin(bot):
-    tz=pytz.timezone(TIMEZONE)
-    now=datetime.now(tz)
-    service=get_calendar_service()
-    if not service:
-        return
-    day_start=tz.localize(datetime(now.year,now.month,now.day,0,0))
-    day_end=tz.localize(datetime(now.year,now.month,now.day,23,59))
-    result=service.events().list(calendarId=CALENDAR_ID,timeMin=day_start.isoformat(),timeMax=day_end.isoformat(),singleEvents=True,orderBy="startTime").execute()
-    tasks=[e for e in result.get("items",[]) if e.get("summary","").startswith("✅")]
+
+# ── Closed Loop ───────────────────────────────────────────────────────────────
+
+def get_open_tasks(days_back=7):
+    """Holt alle offenen (nicht erledigten) Aufgaben der letzten N Tage aus dem Kalender."""
+    try:
+        service=get_calendar_service()
+        if not service:
+            return []
+        tz=pytz.timezone(TIMEZONE)
+        now=datetime.now(tz)
+        start=(now-timedelta(days=days_back)).isoformat()
+        end=(now+timedelta(days=14)).isoformat()
+        result=service.events().list(
+            calendarId=CALENDAR_ID,timeMin=start,timeMax=end,
+            maxResults=50,singleEvents=True,orderBy="startTime"
+        ).execute()
+        tasks=[]
+        for e in result.get("items",[]):
+            summary=e.get("summary","")
+            # Offene Aufgaben: ✅ aber NICHT ✅✅ (doppelt = erledigt)
+            if summary.startswith("✅") and not summary.startswith("✅✅"):
+                event_date=e["start"].get("date",e["start"].get("dateTime",""))[:10]
+                assignee=e.get("description","").strip()  # wir speichern Zustaendigen in description
+                tasks.append({
+                    "id":e["id"],
+                    "title":summary.replace("✅ ","").replace("✅","").strip(),
+                    "date":event_date,
+                    "assignee":assignee,
+                    "raw":summary,
+                })
+        return tasks
+    except Exception as e:
+        logger.error(f"get_open_tasks error: {e}")
+        return []
+
+def complete_task(task_id,task_title):
+    """Markiert eine Aufgabe als erledigt (Titel bekommt ✅✅)."""
+    try:
+        service=get_calendar_service()
+        if not service:
+            return False
+        event=service.events().get(calendarId=CALENDAR_ID,eventId=task_id).execute()
+        event["summary"]="✅✅ "+task_title  # doppeltes Haekchen = erledigt
+        service.events().update(calendarId=CALENDAR_ID,eventId=task_id,body=event).execute()
+        return True
+    except Exception as e:
+        logger.error(f"complete_task error: {e}")
+        return False
+
+def assign_task(task_id,task_title,assignee_name):
+    """Weist eine Aufgabe einer Person zu (speichert in description)."""
+    try:
+        service=get_calendar_service()
+        if not service:
+            return False
+        event=service.events().get(calendarId=CALENDAR_ID,eventId=task_id).execute()
+        event["description"]=assignee_name
+        # Titel bekommt Namen wenn noch nicht drin
+        if assignee_name.lower() not in event["summary"].lower():
+            event["summary"]="✅ "+task_title+" ("+assignee_name+")"
+        service.events().update(calendarId=CALENDAR_ID,eventId=task_id,body=event).execute()
+        return True
+    except Exception as e:
+        logger.error(f"assign_task error: {e}")
+        return False
+
+def handle_checkin_response(text,tasks):
+    """
+    Parst die Antwort auf den Abend-Checkin.
+    '1,3' -> Tasks 1 und 3 erledigt
+    'alles' / 'all' -> alle erledigt
+    'nichts' / 'nothing' -> keine erledigt
+    '1 Kate, 2 Karsten' -> Zuweisung
+    """
+    txt=text.strip().lower()
+    completed_indices=[]
+    assignments={}  # index -> name
+
+    if any(w in txt for w in ["alles","alle","all","everything","done"]):
+        completed_indices=list(range(len(tasks)))
+    elif any(w in txt for w in ["nichts","nix","nothing","keine","nope"]):
+        completed_indices=[]
+    else:
+        # Zahlen extrahieren: "1,3" oder "1 und 3" oder "1 3"
+        numbers=re.findall(r"\d+",txt)
+        completed_indices=[int(n)-1 for n in numbers if 0<int(n)<=len(tasks)]
+
+        # Zuweisungen erkennen: "3 kate" oder "aufgabe 3 fuer karsten"
+        for name in ["karsten","kate"]:
+            # suche "N name" oder "name N"
+            matches=re.findall(r"(\d+)\s*"+name+r"|"+name+r"\s*(\d+)",txt)
+            for m in matches:
+                idx=int(m[0] or m[1])-1
+                if 0<=idx<len(tasks):
+                    assignments[idx]=name.capitalize()
+
+    return completed_indices,assignments
+
+async def send_task_list(bot,chat_id,tasks,header=""):
+    """Sendet eine nummerierte Aufgabenliste."""
     if not tasks:
+        await bot.send_message(chat_id=int(chat_id),text="✅ Keine offenen Aufgaben!")
         return
-    msg="Guten Abend! 🌙 Kurzes Check-in:\n\n"
+    msg=header+"\n\n" if header else ""
     for i,t in enumerate(tasks,1):
-        msg+=f"{i}. {t.get('summary','').replace('✅ ','')}\n"
-    msg+="\nWas habt ihr erledigt? z.B. '1,3' oder 'alles' oder 'nichts'"
-    data=load_data()
-    chat_id=data.get("chat_id")
-    if chat_id:
+        assignee=" → "+t["assignee"] if t["assignee"] else ""
+        overdue=""
         try:
-            await bot.send_message(chat_id=int(chat_id),text=msg)
+            task_date=date.fromisoformat(t["date"])
+            if task_date<date.today():
+                overdue=" ⚠️ überfällig!"
         except:
             pass
+        msg+=str(i)+". "+t["title"]+assignee+overdue+"\n"
+    await bot.send_message(chat_id=int(chat_id),text=msg)
+
+async def task_reminder(bot):
+    """Mittags-Reminder (12 Uhr) für überfällige Aufgaben – nur wenn es welche gibt."""
+    tz=pytz.timezone(TIMEZONE)
+    now=datetime.now(tz)
+    tasks=get_open_tasks(days_back=30)
+    overdue=[t for t in tasks if t["date"]<now.strftime("%Y-%m-%d")]
+    if not overdue:
+        return
+    data=load_data()
+
+    for uid,uinfo in USERS.items():
+        lang=uinfo.get("lang","de")
+        # Aufgaben für diesen User filtern (alle wenn kein Assignee, sonst nur seine)
+        my_tasks=[t for t in overdue if not t["assignee"] or t["assignee"].lower()==uinfo["name"].lower()]
+        if not my_tasks:
+            continue
+        if lang=="de":
+            header=f"⏰ Reminder: {len(my_tasks)} überfällige Aufgabe(n):"
+        else:
+            header=f"⏰ Reminder: {len(my_tasks)} overdue task(s):"
+        try:
+            await send_task_list(bot,uid,my_tasks,header)
+        except Exception as e:
+            logger.error(f"Reminder error {uinfo['name']}: {e}")
+
+async def weekly_review(bot):
+    """Sonntags 18 Uhr: Wöchentliches Review aller offenen Aufgaben."""
+    tasks=get_open_tasks(days_back=30)
+    data=load_data()
+
+    for uid,uinfo in USERS.items():
+        lang=uinfo.get("lang","de")
+        if lang=="de":
+            header="📊 Wochenreview – offene Aufgaben:"
+            footer="\n\nWas soll auf naechste Woche? Einfach antworten!"
+        else:
+            header="📊 Weekly Review – open tasks:"
+            footer="\n\nWhat should move to next week? Just reply!"
+        try:
+            msg_tasks=tasks if tasks else []
+            if not msg_tasks:
+                await bot.send_message(chat_id=int(uid),
+                    text="🎉 Super Woche! Alle Aufgaben erledigt." if lang=="de" else "🎉 Great week! All tasks done.")
+            else:
+                await send_task_list(bot,uid,msg_tasks,header)
+                await bot.send_message(chat_id=int(uid),text=footer)
+        except Exception as e:
+            logger.error(f"Weekly review error {uinfo['name']}: {e}")
+
+async def evening_checkin(bot):
+    """20 Uhr: Abend-Checkin mit allen offenen Aufgaben."""
+    tz=pytz.timezone(TIMEZONE)
+    now=datetime.now(tz)
+    tasks=get_open_tasks(days_back=7)
+    if not tasks:
+        return
+    data=load_data()
+    data["checkin_tasks"]=tasks
+    save_data(data)
+    for uid,uinfo in USERS.items():
+        lang=uinfo.get("lang","de")
+        my_tasks=[t for t in tasks if not t["assignee"] or t["assignee"].lower()==uinfo["name"].lower()]
+        if not my_tasks:
+            continue
+        if lang=="de":
+            header="\U0001f319 Guten Abend "+uinfo["name"]+"! Kurzes Check-in:"
+            footer="\nWas hast du erledigt? z.B. '1,3' · 'alles' · 'nichts'\nOder zuweisen: '2 Kate' '3 Karsten'"
+        else:
+            header="\U0001f319 Good evening "+uinfo["name"]+"! Quick check-in:"
+            footer="\nWhat did you finish? e.g. '1,3' · 'all' · 'nothing'\nOr assign: '2 Kate' '3 Karsten'"
+        try:
+            msg=header+"\n\n"
+            for i,t in enumerate(my_tasks,1):
+                overdue=" \u26a0\ufe0f" if t["date"]<now.strftime("%Y-%m-%d") else ""
+                msg+=str(i)+". "+t["title"]+overdue+"\n"
+            msg+=footer
+            await bot.send_message(chat_id=int(uid),text=msg)
+        except Exception as e:
+            logger.error(f"Evening checkin error {uinfo['name']}: {e}")
+
 
 async def scheduler(bot):
     import asyncio
@@ -686,8 +911,14 @@ async def scheduler(bot):
         if now.hour==7 and now.minute==0:
             await generate_briefing(bot)
             await asyncio.sleep(61)
+        elif now.hour==12 and now.minute==0:
+            await task_reminder(bot)
+            await asyncio.sleep(61)
         elif now.hour==20 and now.minute==0:
             await evening_checkin(bot)
+            await asyncio.sleep(61)
+        elif now.hour==18 and now.minute==0 and now.weekday()==6:  # Sonntag 18 Uhr
+            await weekly_review(bot)
             await asyncio.sleep(61)
         else:
             await asyncio.sleep(30)
@@ -742,11 +973,37 @@ async def handle_text(update,context):
     if any(kw in text.lower() for kw in BRIEFING_KEYWORDS):
         await generate_briefing(context.bot,target_user_id=user_id)
         return
+    # ── Checkin-Antwort verarbeiten ──
+    checkin_tasks=data.get("checkin_tasks",[])
+    if checkin_tasks:
+        txt_low=text.strip().lower()
+        is_checkin_reply=(
+            any(w in txt_low for w in ["alles","alle","all","nichts","nix","nothing","done","erledigt","fertig"]) or
+            bool(re.search(r"^\s*[\d,\s]+\s*$",txt_low)) or
+            bool(re.search(r"\d+\s*(kate|karsten)",txt_low)) or
+            bool(re.search(r"(kate|karsten)\s*\d+",txt_low))
+        )
+        if is_checkin_reply:
+            completed_idx,assignments=handle_checkin_response(text,checkin_tasks)
+            msgs=[]
+            for idx,task in enumerate(checkin_tasks):
+                if idx in assignments:
+                    assign_task(task["id"],task["title"],assignments[idx])
+                    msgs.append("📌 "+task["title"]+" → "+assignments[idx])
+                elif idx in completed_idx:
+                    complete_task(task["id"],task["title"])
+                    msgs.append("✅✅ "+task["title"])
+            if not msgs:
+                msgs=["OK, nichts markiert." if USERS.get(user_id,{}).get("lang")=="de" else "OK, nothing marked."]
+            del data["checkin_tasks"]
+            save_data(data)
+            await update.message.reply_text("\n".join(msgs))
+            return
     await update.message.chat.send_action("typing")
     intent_data=detect_intent(text,user_id,data)
     intent=intent_data.get("intent","general")
     pending=None
-    if intent in ["create_event","create_task","create_list","create_note","query_events"]:
+    if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks"]:
         result=execute_intent(intent_data,user_id,data)
         if isinstance(result,tuple):
             response,pending=result
@@ -808,7 +1065,7 @@ async def handle_voice(update,context):
     intent_data=detect_intent(text,user_id,data)
     intent=intent_data.get("intent","general")
     pending=None
-    if intent in ["create_event","create_task","create_list","create_note","query_events"]:
+    if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks"]:
         result=execute_intent(intent_data,user_id,data)
         if isinstance(result,tuple):
             response,pending=result
