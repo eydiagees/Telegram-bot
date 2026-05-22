@@ -40,7 +40,7 @@ def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE,"r",encoding="utf-8") as f:
             return json.load(f)
-    return {"notes":[],"todos":[],"conversation":[],"memory":{"persons":{},"patterns":{},"preferences":{}},"pending_event":None}
+    return {"notes":[],"todos":[],"conversation":[],"memory":{"persons":{},"patterns":{},"preferences":{}},"pending_event":None,"context":{"schedule":{},"current":{},"availability":{}}}
 
 def save_data(data):
     with open(DATA_FILE,"w",encoding="utf-8") as f:
@@ -186,6 +186,121 @@ Nutzer: """+user_name+"\nNachricht: "+user_message+"\nAntwort: "+gpt_response
         save_data(data)
     except:
         pass
+
+
+# ── Kontext-System ────────────────────────────────────────────────────────────
+DEFAULT_SCHEDULE = {
+    "karsten": {
+        "work_days": ["montag","dienstag","mittwoch","donnerstag","freitag"],
+        "work_hours": "9-18",
+        "remote_possible": True
+    },
+    "kate": {
+        "teaching_days": ["donnerstag","sonntag"],
+        "teaching_hours": "10-13",
+        "picks_up_marlene": True
+    },
+    "marlene": {
+        "kita_days": ["montag","dienstag","mittwoch","donnerstag","freitag"],
+        "kita_hours": "9-16",
+        "pickup_default": "kate"
+    }
+}
+
+def get_context():
+    data = load_data()
+    context = data.get("context", {"schedule": DEFAULT_SCHEDULE, "current": {}, "availability": {}})
+    if not context.get("schedule"):
+        context["schedule"] = DEFAULT_SCHEDULE
+    return context
+
+def save_context(context):
+    data = load_data()
+    data["context"] = context
+    save_data(data)
+
+def get_context_summary():
+    context = get_context()
+    current = context.get("current", {})
+    schedule = context.get("schedule", {})
+    
+    summary = "\nAktueller Kontext:\n"
+    
+    # Current situations
+    if current:
+        for person, situation in current.items():
+            summary += f"- {person}: {situation.get('status','')} "
+            if situation.get('until'):
+                summary += f"bis {situation['until']}"
+            if situation.get('note'):
+                summary += f" ({situation['note']})"
+            summary += "\n"
+    else:
+        summary += "- Normaler Alltag\n"
+    
+    # Coverage warnings
+    karsten_away = current.get("karsten", {}).get("status") in ["geschaeftsreise","reise","krank","abwesend","away","traveling","sick"]
+    kate_away = current.get("kate", {}).get("status") in ["geschaeftsreise","reise","krank","abwesend","away","traveling","sick"]
+    
+    if karsten_away and kate_away:
+        summary += "⚠️ BEIDE abwesend - Kinderbetreuung klaeren!\n"
+    elif karsten_away:
+        summary += "⚠️ Karsten abwesend - Kate uebernimmt Marlene\n"
+    elif kate_away:
+        summary += "⚠️ Kate abwesend - Karsten uebernimmt Marlene\n"
+    
+    return summary
+
+def update_context_from_message(user_message, user_id):
+    user_name = USER_NAMES.get(user_id, "").lower()
+    msg_lower = user_message.lower()
+    
+    # Detect context changes
+    travel_keywords = ["geschaeftsreise", "business trip", "reise", "traveling", "auf reise", "unterwegs", "away"]
+    vacation_keywords = ["urlaub", "vacation", "holiday", "ferien"]
+    home_keywords = ["zuhause", "home office", "working from home", "homeoffice"]
+    sick_keywords = ["krank", "sick", "nicht gut", "feeling ill"]
+    normal_keywords = ["zurueck", "back", "wieder da", "im buero", "normal"]
+    
+    context = get_context()
+    current = context.get("current", {})
+    
+    # Extract dates
+    import re
+    date_pattern = r"(\d{1,2}\.?\d{0,2}\.?\d{0,4})"
+    dates = re.findall(date_pattern, user_message)
+    
+    status = None
+    if any(kw in msg_lower for kw in travel_keywords):
+        status = "geschaeftsreise"
+    elif any(kw in msg_lower for kw in vacation_keywords):
+        status = "urlaub"
+    elif any(kw in msg_lower for kw in home_keywords):
+        status = "homeoffice"
+    elif any(kw in msg_lower for kw in sick_keywords):
+        status = "krank"
+    elif any(kw in msg_lower for kw in normal_keywords):
+        if user_name in current:
+            del current[user_name]
+            context["current"] = current
+            save_context(context)
+            return f"{user_name.capitalize()} ist wieder zurueck - normaler Alltag!"
+    
+    if status and user_name:
+        current[user_name] = {
+            "status": status,
+            "until": dates[-1] if dates else None,
+            "note": user_message[:100]
+        }
+        context["current"] = current
+        save_context(context)
+        
+        # Check coverage
+        if status in ["geschaeftsreise","reise","krank","abwesend"]:
+            partner_name = "kate" if user_name == "karsten" else "karsten"
+            return f"Verstanden! {user_name.capitalize()} ist {status}. {partner_name.capitalize()} uebernimmt Marlene-Betreuung."
+    
+    return None
 
 # ── Intent Engine ─────────────────────────────────────────────────────────────
 INTENT_SYSTEM="""Du bist ein Intent-Erkennungs-System. Analysiere die Nachricht und gib NUR ein JSON-Array zurueck.
@@ -563,6 +678,11 @@ async def handle_text(update,context):
             return
     if any(kw in text.lower() for kw in BRIEFING_KEYWORDS):
         await generate_briefing(context.bot,target_user_id=user_id)
+        return
+    # Check for context updates
+    context_update=update_context_from_message(text,user_id)
+    if context_update:
+        await update.message.reply_text(context_update)
         return
     await update.message.chat.send_action("typing")
     intents=detect_intents(text,user_id,data)
