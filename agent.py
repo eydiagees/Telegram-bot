@@ -33,14 +33,14 @@ USERS={
 
 JA_WORDS=["JA","YES","J","Y","YEP","YA","JO","SURE","OK","OKAY","DO IT","MACH ES","EINTRAGEN","ADD IT","GO","JETZT","NOW"]
 NEIN_WORDS=["NEIN","NO","CANCEL","ABBRECHEN","STOP","NOPE","NEE","NAH","NICHT","VERGISS ES","FORGET IT","SKIP","LASS ES"]
-BRIEFING_KEYWORDS=["briefing","was steht an","mein tag","morning briefing","daily briefing","was haben wir heute","ueberblick","schick briefing"]
+BRIEFING_KEYWORDS=["tagesplan","briefing","was steht an","mein tag","morning briefing","daily briefing","was haben wir heute","ueberblick","schick briefing"]
 
 # ── Datenpersistenz ───────────────────────────────────────────────────────────
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE,"r",encoding="utf-8") as f:
             return json.load(f)
-    return {"notes":[],"todos":[],"conversation":[],"memory":{"persons":{},"patterns":{},"preferences":{}},"pending_event":None,"context":{"schedule":{},"current":{},"availability":{}}}
+    return {"notes":[],"todos":[],"conversation":[],"memory":{"persons":{},"patterns":{},"preferences":{}},"pending_event":None}
 
 def save_data(data):
     with open(DATA_FILE,"w",encoding="utf-8") as f:
@@ -108,12 +108,17 @@ def add_calendar_event(title,start_dt,end_dt=None):
         logger.error(f"Event error: {e}")
         return False
 
-def add_allday_event(title,dt):
+def add_allday_event(title,dt,end_dt=None):
     try:
         service=get_calendar_service()
         if not service:
             return False
-        event={"summary":title,"start":{"date":dt.strftime("%Y-%m-%d")},"end":{"date":(dt+timedelta(days=1)).strftime("%Y-%m-%d")}}
+        # end_dt is exclusive in Google Calendar (day after last day)
+        if end_dt is None:
+            end_date=(dt+timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            end_date=(end_dt+timedelta(days=1)).strftime("%Y-%m-%d")
+        event={"summary":title,"start":{"date":dt.strftime("%Y-%m-%d")},"end":{"date":end_date}}
         service.events().insert(calendarId=CALENDAR_ID,body=event).execute()
         return True
     except Exception as e:
@@ -187,163 +192,26 @@ Nutzer: """+user_name+"\nNachricht: "+user_message+"\nAntwort: "+gpt_response
     except:
         pass
 
-
-# ── Kontext-System ────────────────────────────────────────────────────────────
-DEFAULT_SCHEDULE = {
-    "karsten": {
-        "work_days": ["montag","dienstag","mittwoch","donnerstag","freitag"],
-        "work_hours": "9-18",
-        "remote_possible": True
-    },
-    "kate": {
-        "teaching_days": ["donnerstag","sonntag"],
-        "teaching_hours": "10-13",
-        "picks_up_marlene": True
-    },
-    "marlene": {
-        "kita_days": ["montag","dienstag","mittwoch","donnerstag","freitag"],
-        "kita_hours": "9-16",
-        "pickup_default": "kate"
-    }
-}
-
-def get_context():
-    data = load_data()
-    context = data.get("context", {"schedule": DEFAULT_SCHEDULE, "current": {}, "availability": {}})
-    if not context.get("schedule"):
-        context["schedule"] = DEFAULT_SCHEDULE
-    return context
-
-def save_context(context):
-    data = load_data()
-    data["context"] = context
-    save_data(data)
-
-def get_context_summary():
-    context = get_context()
-    current = context.get("current", {})
-    schedule = context.get("schedule", {})
-    
-    summary = "\nAktueller Kontext:\n"
-    
-    # Current situations
-    if current:
-        for person, situation in current.items():
-            summary += f"- {person}: {situation.get('status','')} "
-            if situation.get('until'):
-                summary += f"bis {situation['until']}"
-            if situation.get('note'):
-                summary += f" ({situation['note']})"
-            summary += "\n"
-    else:
-        summary += "- Normaler Alltag\n"
-    
-    # Coverage warnings
-    karsten_away = current.get("karsten", {}).get("status") in ["geschaeftsreise","reise","krank","abwesend","away","traveling","sick"]
-    kate_away = current.get("kate", {}).get("status") in ["geschaeftsreise","reise","krank","abwesend","away","traveling","sick"]
-    
-    if karsten_away and kate_away:
-        summary += "⚠️ BEIDE abwesend - Kinderbetreuung klaeren!\n"
-    elif karsten_away:
-        summary += "⚠️ Karsten abwesend - Kate uebernimmt Marlene\n"
-    elif kate_away:
-        summary += "⚠️ Kate abwesend - Karsten uebernimmt Marlene\n"
-    
-    return summary
-
-def update_context_from_message(user_message, user_id):
-    user_name = USER_NAMES.get(user_id, "").lower()
-    msg_lower = user_message.lower()
-    
-    # Detect context changes
-    travel_keywords = ["geschaeftsreise", "business trip", "reise", "traveling", "auf reise", "unterwegs", "away"]
-    vacation_keywords = ["urlaub", "vacation", "holiday", "ferien"]
-    home_keywords = ["zuhause", "home office", "working from home", "homeoffice"]
-    sick_keywords = ["krank", "sick", "nicht gut", "feeling ill"]
-    normal_keywords = ["zurueck", "back", "wieder da", "im buero", "normal"]
-    
-    context = get_context()
-    current = context.get("current", {})
-    
-    # Extract dates
-    import re
-    date_pattern = r"(\d{1,2}\.?\d{0,2}\.?\d{0,4})"
-    dates = re.findall(date_pattern, user_message)
-    
-    status = None
-    if any(kw in msg_lower for kw in travel_keywords):
-        status = "geschaeftsreise"
-    elif any(kw in msg_lower for kw in vacation_keywords):
-        status = "urlaub"
-    elif any(kw in msg_lower for kw in home_keywords):
-        status = "homeoffice"
-    elif any(kw in msg_lower for kw in sick_keywords):
-        status = "krank"
-    elif any(kw in msg_lower for kw in normal_keywords):
-        if user_name in current:
-            del current[user_name]
-            context["current"] = current
-            save_context(context)
-            return f"{user_name.capitalize()} ist wieder zurueck - normaler Alltag!"
-    
-    if status and user_name:
-        current[user_name] = {
-            "status": status,
-            "until": dates[-1] if dates else None,
-            "note": user_message[:100]
-        }
-        context["current"] = current
-        save_context(context)
-        
-        # Check coverage
-        if status in ["geschaeftsreise","reise","krank","abwesend"]:
-            partner_name = "kate" if user_name == "karsten" else "karsten"
-            return f"Verstanden! {user_name.capitalize()} ist {status}. {partner_name.capitalize()} uebernimmt Marlene-Betreuung."
-    
-    return None
-
 # ── Intent Engine ─────────────────────────────────────────────────────────────
-INTENT_SYSTEM="""Du bist ein Intent-Erkennungs-System. Analysiere die Nachricht und gib NUR ein JSON-Array zurueck.
+INTENT_SYSTEM="""Du bist ein Intent-Erkennungs-System. Analysiere die Nachricht und gib NUR JSON zurueck.
 Karsten (ID: 281391093) spricht Deutsch. Kate (ID: 934428072) spricht Englisch.
 
 Intents:
-- create_event: Termin mit Uhrzeit
-- create_task: Aufgabe/Todo ohne Uhrzeit -> ganztaegig im Kalender
-- create_list: Einkaufsliste -> ganztaegig mit Emoji
+- create_event: Termin MIT Uhrzeit (z.B. Arzt 10 Uhr) ODER ganztaegiger Termin ohne Uhrzeit (z.B. Geschaeftsreise, Urlaub, Geburtstag)
+- create_task: Aufgabe/Todo -> ganztaegig im Kalender mit ✅
+- create_list: Einkaufsliste -> ganztaegig mit 🛒
 - create_note: Kurze Notiz
 - query_events: Termine abfragen
 - general: Alles andere
 
+WICHTIG fuer Reisen/Urlaub/Abwesenheiten:
+- Reisen, Geschaeftsreisen, Urlaub, Abwesenheiten IMMER als create_event mit allday:true
+- Bei mehrtaegigen Ereignissen: date=Startdatum, end_date=letzter Tag (inklusiv), allday:true
+- Keine Zeit angeben wenn allday:true
+
 Affects: "self"=nur Schreiber, "partner"=nur Partner, "both"=beide
 
-Format (IMMER ein Array):
-[
-  {"intent":"create_event","title":"...","date":"YYYY-MM-DD","time":"HH:MM","duration_hours":1,"affects":"self"},
-  {"intent":"create_task","title":"...","date":null,"affects":"self"},
-  {"intent":"create_list","items":["item1","item2"],"affects":"self"},
-  {"intent":"create_note","text":"...","affects":"self"},
-  {"intent":"general","text":"..."}
-]
-Beispiel "Anzughose gerissen, Chili-Oel kaufen":
-[{"intent":"create_task","title":"Anzughose Ersatz","date":null,"affects":"self"},{"intent":"create_list","items":["Chili-Oel"],"affects":"self"}]"""
-
-def detect_intents(user_message,user_id,context_data):
-    tz=pytz.timezone(TIMEZONE)
-    now_str=datetime.now(tz).strftime("%d.%m.%Y %H:%M")
-    user_name=USER_NAMES.get(user_id,"")
-    user_info=USERS.get(user_id,{})
-    partner_id=user_info.get("partner_id","")
-    partner_name=USER_NAMES.get(partner_id,"Partner")
-    prompt=INTENT_SYSTEM+"\n\nZeit: "+now_str+"\nSchreiber: "+user_name+"\nPartner: "+partner_name+"\nNachricht: "+user_message
-    try:
-        response=client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":prompt}],max_tokens=500)
-        text=response.choices[0].message.content.strip()
-        match=re.search(r'\[.*\]',text,re.DOTALL)
-        if match:
-            return json.loads(match.group())
-        return [{"intent":"general","text":user_message}]
-    except:
-        return [{"intent":"general","text":user_message}]
+Format: {"intent":"create_event","title":"...","date":"YYYY-MM-DD","end_date":"YYYY-MM-DD","time":"HH:MM","duration_hours":1,"allday":false,"affects":"self","text":"...","items":[]}"""
 
 def detect_intent(user_message,user_id,context_data):
     tz=pytz.timezone(TIMEZONE)
@@ -368,10 +236,27 @@ def execute_intent(intent_data,user_id,context_data):
     if intent=="create_event":
         title=intent_data.get("title","Termin")
         date_str=intent_data.get("date")
-        time_str=intent_data.get("time","09:00")
+        end_date_str=intent_data.get("end_date")
+        time_str=intent_data.get("time","")
         duration=intent_data.get("duration_hours",1)
+        allday=intent_data.get("allday",False)
         if not date_str:
             return "Ich brauche noch ein Datum. Wann soll der Termin stattfinden?",None
+        # Auto-detect allday: no time given, or explicitly flagged
+        if not time_str or allday:
+            try:
+                start_d=date.fromisoformat(date_str)
+                end_d=date.fromisoformat(end_date_str) if end_date_str else start_d
+                ok=add_allday_event(title,datetime(start_d.year,start_d.month,start_d.day),
+                                    datetime(end_d.year,end_d.month,end_d.day) if end_date_str else None)
+                if ok:
+                    if end_date_str and end_date_str!=date_str:
+                        return "Eingetragen: "+title+" vom "+start_d.strftime("%d.%m.%Y")+" bis "+end_d.strftime("%d.%m.%Y"),None
+                    else:
+                        return "Eingetragen: "+title+" am "+start_d.strftime("%d.%m.%Y")+" (ganztaegig)",None
+                return "Fehler beim Eintragen!",None
+            except Exception as e:
+                return "Fehler: "+str(e),None
         if not time_str:
             time_str="09:00"
         try:
@@ -444,10 +329,22 @@ def process_calendar(response,data=None):
             parts=line.replace("KALENDER_TERMIN:","").split("|")
             title=parts[0].strip()
             dt_str=parts[1].strip()
+            end_dt_str=parts[2].strip() if len(parts)>2 else None
             tz=pytz.timezone(TIMEZONE)
             if len(dt_str)==10:
+                # Date-only string -> all-day event (travel, holidays, etc.)
                 d=date.fromisoformat(dt_str)
-                dt=tz.localize(datetime(d.year,d.month,d.day,9,0))
+                end_d=date.fromisoformat(end_dt_str) if end_dt_str and len(end_dt_str)==10 else None
+                ok=add_allday_event(title,datetime(d.year,d.month,d.day),
+                                    datetime(end_d.year,end_d.month,end_d.day) if end_d else None)
+                if ok:
+                    if end_d and end_d!=d:
+                        results.append("Eingetragen: "+title+" vom "+d.strftime("%d.%m.%Y")+" bis "+end_d.strftime("%d.%m.%Y"))
+                    else:
+                        results.append("Eingetragen: "+title+" am "+d.strftime("%d.%m.%Y")+" (ganztaegig)")
+                else:
+                    results.append("Fehler bei: "+title)
+                continue
             else:
                 dt=tz.localize(datetime.fromisoformat(dt_str[:16]))
             end_dt=dt+timedelta(hours=1)
@@ -502,26 +399,14 @@ async def generate_personal_briefing(user_id,user_name,lang="de"):
     memory_ctx=get_memory_context()
     if lang=="de":
         prompt=("Erstelle ein kurzes persoenliches Morgen-Briefing auf Deutsch fuer "+user_name+" (ADHS).\n"
-            "Heute: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nAlle Termine:\n"+events+"\n"+memory_ctx+
-            "\nWICHTIG: Unterscheide klar zwischen:\n"
-            "- "+user_name+"s eigene Termine/Aufgaben (✅ und Termine ohne Emoji die fuer ihn sind)\n"
-            "- Gemeinsame Termine (beide betroffen)\n"
-            "- Partner-Termine die "+user_name+" kennen sollte zur Koordination\n"
-            "Aufgaben mit ✅ die fuer den Partner sind NUR kurz erwaehnen zur Info.\n"
-            "Briefing soll:\n- Mit 'Guten Morgen "+user_name+"!' beginnen\n"
-            "- Eigene Termine zuerst\n- Gemeinsame Termine\n"
-            "- Partner-Info kurz\n- Offene eigene Aufgaben\n- Max 8 Zeilen")
+            "Heute: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nTermine:\n"+events+"\n"+memory_ctx+
+            "\nBriefing soll:\n- Mit 'Guten Morgen "+user_name+"!' beginnen\n- Heutigen Tag nennen\n"
+            "- Relevante Termine erwaehnen\n- Koordination mit Partner\n- Offene Aufgaben\n- Morgen kurz\n- Max 8 Zeilen")
     else:
         prompt=("Create a short personal morning briefing in English for "+user_name+" (ADHD).\n"
-            "Today: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nAll events:\n"+events+"\n"+memory_ctx+
-            "\nIMPORTANT: Clearly distinguish between:\n"
-            "- "+user_name+"'s own events/tasks (her Reformer classes, her tasks)\n"
-            "- Shared events (both affected)\n"
-            "- Partner's events "+user_name+" should know for coordination\n"
-            "Tasks with ✅ that belong to the partner should only be briefly mentioned.\n"
-            "Briefing should:\n- Start with 'Good morning "+user_name+"!'\n"
-            "- Own events first\n- Shared events\n"
-            "- Partner info briefly\n- Open own tasks\n- Max 8 lines")
+            "Today: "+weekday+" "+now.strftime("%d.%m.%Y")+"\nEvents:\n"+events+"\n"+memory_ctx+
+            "\nBriefing should:\n- Start with 'Good morning "+user_name+"!'\n- Mention today\n"
+            "- Relevant events\n- Coordination with partner\n- Open tasks\n- Brief look tomorrow\n- Max 8 lines")
     response=client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":prompt}],max_tokens=300)
     return response.choices[0].message.content
 
@@ -563,64 +448,12 @@ async def evening_checkin(bot):
         except:
             pass
 
-async def analyze_notes(bot):
-    data=load_data()
-    notes=data.get("notes",[])
-    if not notes:
-        return
-    unprocessed=[n for n in notes if not n.get("processed")]
-    if not unprocessed:
-        return
-    notes_text="\n".join([f"- {n['datum']}: {n['text']}" for n in unprocessed])
-    prompt="""Analysiere diese Notizen und leite daraus Aufgaben ab. Gib NUR JSON Array zurueck.
-Format: [{"type":"task","title":"...","date":"YYYY-MM-DD oder null"},{"type":"info","text":"..."}]
-Notizen:
-"""+notes_text
-    try:
-        response=client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":prompt}],max_tokens=400,response_format={"type":"json_object"})
-        result=json.loads(response.choices[0].message.content)
-        actions=result if isinstance(result,list) else result.get("actions",[])
-        tz=pytz.timezone(TIMEZONE)
-        now=datetime.now(tz)
-        added=[]
-        for action in actions:
-            if action.get("type")=="task":
-                title=action.get("title","")
-                date_str=action.get("date")
-                if date_str:
-                    try:
-                        d=date.fromisoformat(date_str)
-                        dt=datetime(d.year,d.month,d.day)
-                    except:
-                        dt=now
-                else:
-                    dt=now
-                ok=add_allday_event("✅ "+title,dt)
-                if ok:
-                    added.append(title)
-        for n in unprocessed:
-            n["processed"]=True
-        data["notes"]=notes
-        save_data(data)
-        if added:
-            msg="📋 Aus euren Notizen habe ich folgende Aufgaben abgeleitet:\n"
-            msg+="\n".join(["- ✅ "+a for a in added])
-            data2=load_data()
-            chat_id=data2.get("chat_id")
-            if chat_id:
-                await bot.send_message(chat_id=int(chat_id),text=msg)
-    except Exception as e:
-        logger.error(f"analyze_notes error: {e}")
-
 async def scheduler(bot):
     import asyncio
     tz=pytz.timezone(TIMEZONE)
     while True:
         now=datetime.now(tz)
-        if now.hour==6 and now.minute==50:
-            await analyze_notes(bot)
-            await asyncio.sleep(61)
-        elif now.hour==7 and now.minute==0:
+        if now.hour==7 and now.minute==0:
             await generate_briefing(bot)
             await asyncio.sleep(61)
         elif now.hour==20 and now.minute==0:
@@ -679,31 +512,17 @@ async def handle_text(update,context):
     if any(kw in text.lower() for kw in BRIEFING_KEYWORDS):
         await generate_briefing(context.bot,target_user_id=user_id)
         return
-    # Check for context updates
-    context_update=update_context_from_message(text,user_id)
-    if context_update:
-        await update.message.reply_text(context_update)
-        return
     await update.message.chat.send_action("typing")
-    intents=detect_intents(text,user_id,data)
-    results=[]
+    intent_data=detect_intent(text,user_id,data)
+    intent=intent_data.get("intent","general")
     pending=None
-    has_action=any(i.get("intent") in ["create_event","create_task","create_list","create_note","query_events"] for i in intents)
-    if has_action:
-        for intent_data in intents:
-            intent=intent_data.get("intent","general")
-            if intent in ["create_event","create_task","create_list","create_note","query_events"]:
-                result=execute_intent(intent_data,user_id,data)
-                if isinstance(result,tuple):
-                    r,p=result
-                    if p:
-                        pending=p
-                else:
-                    r=result
-                if r:
-                    results.append(r)
-        response="\n".join(results) if results else None
-        if not response:
+    if intent in ["create_event","create_task","create_list","create_note","query_events"]:
+        result=execute_intent(intent_data,user_id,data)
+        if isinstance(result,tuple):
+            response,pending=result
+        else:
+            response=result
+        if response is None:
             response=await ask_gpt(text,user_id,data)
             response,pending=process_calendar(response,data)
     else:
@@ -779,60 +598,6 @@ async def handle_voice(update,context):
     save_data(data)
     await update.message.reply_text(response)
 
-
-async def handle_photo(update,context):
-    if not is_allowed(update):
-        await update.message.reply_text("Kein Zugriff.")
-        return
-    user_id=str(update.effective_user.id)
-    data=load_data()
-    await update.message.chat.send_action("typing")
-    photo=update.message.photo[-1]
-    photo_file=await context.bot.get_file(photo.file_id)
-    with tempfile.NamedTemporaryFile(suffix=".jpg",delete=False) as tmp:
-        tmp_path=tmp.name
-    await photo_file.download_to_drive(tmp_path)
-    with open(tmp_path,"rb") as f:
-        import base64
-        image_data=base64.b64encode(f.read()).decode("utf-8")
-    os.unlink(tmp_path)
-    caption=update.message.caption or ""
-    user_name=USER_NAMES.get(user_id,"")
-    tz=pytz.timezone(TIMEZONE)
-    now_str=datetime.now(tz).strftime("%d.%m.%Y %H:%M")
-    system_prompt=(
-        "Du bist ein KI-Assistent fuer ein Paar mit ADHS. "
-        "Analysiere dieses Bild und extrahiere alle relevanten Informationen. "
-        "Zeit: "+now_str+" Nutzer: "+user_name+"\n"
-        "Suche nach: Terminen, Aufgaben, Einkaufslistens, wichtigen Infos.\n"
-        "Gib eine kurze Zusammenfassung und frage ob du Aktionen durchfuehren sollst.\n"
-        "Antworte in der Sprache des Nutzers."
-    )
-    if caption:
-        system_prompt+="\nNutzer-Kommentar zum Bild: "+caption
-    try:
-        response=client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role":"user",
-                "content":[
-                    {"type":"text","text":system_prompt},
-                    {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"+image_data}}
-                ]
-            }],
-            max_tokens=500
-        )
-        reply=response.choices[0].message.content
-        update_memory_from_message("Foto analysiert: "+reply,user_id,reply)
-        data["conversation"].append({"role":"user","content":"[Foto] "+caption})
-        data["conversation"].append({"role":"assistant","content":reply})
-        if len(data["conversation"])>20:
-            data["conversation"]=data["conversation"][-20:]
-        save_data(data)
-        await update.message.reply_text(reply)
-    except Exception as e:
-        await update.message.reply_text("Fehler beim Analysieren des Fotos: "+str(e))
-
 async def start(update,context):
     user_id=str(update.effective_user.id)
     user_name=USER_NAMES.get(user_id,"")
@@ -847,7 +612,6 @@ def main():
     app.post_init=post_init
     app.add_handler(CommandHandler("start",start))
     app.add_handler(MessageHandler(filters.VOICE,handle_voice))
-    app.add_handler(MessageHandler(filters.PHOTO,handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_text))
     print("Agent laeuft!")
     app.run_polling()
