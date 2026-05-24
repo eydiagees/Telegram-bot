@@ -1444,19 +1444,28 @@ async def handle_text(update,context):
     txt_low=text.lower()
     if any(kw in txt_low for kw in DELETE_KEYWORDS) and not data.get("pending_delete"):
         # Suchbegriff extrahieren: alles nach dem Delete-Keyword
-        title_hint=txt_low
+        title_hint=""
+        matched_kw=""
         for kw in DELETE_KEYWORDS:
-            if kw in title_hint:
-                title_hint=title_hint.split(kw,1)[-1].strip()
+            if kw in txt_low:
+                after=txt_low.split(kw,1)[-1].strip()
+                before=txt_low.split(kw,1)[0].strip()
+                matched_kw=kw
+                # Alles nach dem Keyword nehmen; wenn leer, Wörter davor nehmen
+                title_hint=after if after else before
                 break
         # Füllwörter entfernen
-        for fw in ["den","die","das","den termin","die aufgabe","bitte","mal","doch","den eintrag"]:
+        STOP=["den","die","das","den termin","die aufgabe","bitte","mal","doch","den eintrag",
+              "the","please","the appointment","the task","kannst du","can you","würdest du"]
+        for fw in STOP:
             title_hint=title_hint.replace(fw,"").strip()
-        if title_hint:
+        # Satzzeichen weg
+        title_hint=title_hint.strip("?.!,")
+        if title_hint and len(title_hint)>1:
             await update.message.chat.send_action("typing")
             matches=find_events_by_title(title_hint)
             if not matches:
-                await update.message.reply_text("Keinen Termin gefunden mit '"+title_hint+"'. Gibt es ihn noch im Kalender?")
+                await update.message.reply_text("Keinen Termin gefunden mit \'"+title_hint+"\'. Gibt es ihn noch im Kalender?")
                 return
             if len(matches)==1:
                 e=matches[0]
@@ -1611,14 +1620,19 @@ async def handle_voice(update,context):
     DELETE_KEYWORDS=["lösch","loesch","lösche","loeschen","delete","entfern","entfernen","absagen","stornieren","cancel","remove"]
     txt_low=text.lower()
     if any(kw in txt_low for kw in DELETE_KEYWORDS) and not data.get("pending_delete"):
-        title_hint=txt_low
+        title_hint=""
         for kw in DELETE_KEYWORDS:
-            if kw in title_hint:
-                title_hint=title_hint.split(kw,1)[-1].strip()
+            if kw in txt_low:
+                after=txt_low.split(kw,1)[-1].strip()
+                before=txt_low.split(kw,1)[0].strip()
+                title_hint=after if after else before
                 break
-        for fw in ["den","die","das","den termin","die aufgabe","bitte","mal","doch"]:
+        STOP=["den","die","das","den termin","die aufgabe","bitte","mal","doch",
+              "the","please","the appointment","kannst du","can you","bitte"]
+        for fw in STOP:
             title_hint=title_hint.replace(fw,"").strip()
-        if title_hint:
+        title_hint=title_hint.strip("?.!,")
+        if title_hint and len(title_hint)>1:
             matches=find_events_by_title(title_hint)
             if not matches:
                 await update.message.reply_text("Keinen Termin gefunden mit '"+title_hint+"'.")
