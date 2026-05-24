@@ -1152,12 +1152,46 @@ async def handle_text(update,context):
             return
         # Wenn weder JA noch NEIN: State behalten, weitermachen
     if pending_delete_list:
-        txt=text.strip().upper().replace("!","").replace(".","").strip()
-        if any(txt==w or txt.startswith(w) for w in NEIN_WORDS):
+        txt_upper=text.strip().upper().replace("!","").replace(".","").strip()
+        txt_low=text.strip().lower()
+        # Explizites NEIN ohne Lösch-Keyword -> abbrechen
+        is_nein=any(txt_upper==w or txt_upper.startswith(w) for w in NEIN_WORDS)
+        has_delete_kw=any(kw in txt_low for kw in ["lösch","loesch","delete","entfern","cancel","ja","yes"])
+        if is_nein and not has_delete_kw:
             data.pop("pending_delete_list",None)
             save_data(data)
             await update.message.reply_text("OK, nichts gelöscht.")
             return
+        # "heute"/"today" -> heutiges Datum matchen
+        tz=pytz.timezone(TIMEZONE)
+        today_str=datetime.now(tz).strftime("%Y-%m-%d")
+        if any(w in txt_low for w in ["heute","today"]):
+            for i,e in enumerate(pending_delete_list):
+                if e.get("date","")==today_str:
+                    data["pending_delete"]=e
+                    data.pop("pending_delete_list",None)
+                    save_data(data)
+                    await update.message.reply_text("Soll ich '"+e["title"]+"' am "+e["date"]+" löschen? JA oder NEIN.")
+                    return
+            await update.message.reply_text("Kein Treffer für heute. Bitte Nummer eingeben (1-"+str(len(pending_delete_list))+").")
+            return
+        # Datum direkt nennen z.B. "24.05" oder "2026-06-02"
+        date_match=re.search(r"(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?",text)
+        if date_match:
+            d,m=int(date_match.group(1)),int(date_match.group(2))
+            yr=int(date_match.group(3)) if date_match.group(3) else datetime.now(tz).year
+            if yr<100: yr+=2000
+            try:
+                target=f"{yr:04d}-{m:02d}-{d:02d}"
+                for e in pending_delete_list:
+                    if e.get("date","")==target:
+                        data["pending_delete"]=e
+                        data.pop("pending_delete_list",None)
+                        save_data(data)
+                        await update.message.reply_text("Soll ich '"+e["title"]+"' am "+e["date"]+" löschen? JA oder NEIN.")
+                        return
+            except:
+                pass
         nums=re.findall(r"\d+",text)
         if nums:
             try:
@@ -1167,7 +1201,7 @@ async def handle_text(update,context):
                     data["pending_delete"]=e
                     data.pop("pending_delete_list",None)
                     save_data(data)
-                    await update.message.reply_text("Soll ich '"+e["title"]+"' am "+e["date"]+" löschen? Antworte mit JA oder NEIN.")
+                    await update.message.reply_text("Soll ich '"+e["title"]+"' am "+e["date"]+" löschen? JA oder NEIN.")
                     return
                 else:
                     await update.message.reply_text("Ungültige Nummer. Bitte 1-"+str(len(pending_delete_list))+" eingeben.")
