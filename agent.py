@@ -635,7 +635,7 @@ Karsten (ID: 281391093) spricht Deutsch. Kate (ID: 934428072) spricht Englisch.
 
 Intents:
 - create_event: Termin MIT Uhrzeit (z.B. Arzt 10 Uhr) ODER ganztaegiger Termin ohne Uhrzeit (z.B. Geschaeftsreise, Urlaub, Geburtstag)
-- create_task: Aufgabe/Todo -> ganztaegig im Kalender mit ✅
+- create_task: Aufgabe/Todo -> ganztaegig im Kalender mit ✅. Bei mehreren Aufgaben items-Liste verwenden: {"intent":"create_task","items":["Aufgabe 1","Aufgabe 2"],"date":"..."}. NIEMALS create_event fuer Aufgaben/Todos!
 - create_list: Einkaufsliste -> ganztaegig mit 🛒
 - create_note: Kurze Notiz
 - query_events: Termine abfragen
@@ -723,7 +723,7 @@ def execute_intent(intent_data,user_id,context_data):
             return "Fehler: "+str(e),None
 
     elif intent=="create_task":
-        text=intent_data.get("text") or intent_data.get("title","Aufgabe")
+        # Unterstützt einzelne Aufgabe (text/title) und mehrere (items-Liste)
         deadline=intent_data.get("date")
         try:
             if deadline:
@@ -731,8 +731,32 @@ def execute_intent(intent_data,user_id,context_data):
                 dt=datetime(d.year,d.month,d.day)
             else:
                 dt=now
-            ok=add_allday_event("✅ "+text,dt)
-            return ("Aufgabe eingetragen: ✅ "+text if ok else "Fehler!"),None
+            # Bulk: items-Liste vorhanden?
+            items=intent_data.get("items",[])
+            if not items:
+                single=intent_data.get("text") or intent_data.get("title","Aufgabe")
+                items=[single] if single else []
+            if not items:
+                return "Was soll ich als Aufgabe eintragen?",None
+            saved=[]
+            failed=[]
+            for task_text in items:
+                task_text=str(task_text).strip()
+                if not task_text:
+                    continue
+                ok=add_allday_event("✅ "+task_text,dt)
+                if ok:
+                    saved.append(task_text)
+                else:
+                    failed.append(task_text)
+            if saved and not failed:
+                if len(saved)==1:
+                    return "Aufgabe eingetragen: ✅ "+saved[0],None
+                else:
+                    return "✅ "+str(len(saved))+" Aufgaben eingetragen:\n"+"\n".join("• "+t for t in saved),None
+            elif saved and failed:
+                return "✅ Eingetragen: "+", ".join(saved)+"\n❌ Fehler bei: "+", ".join(failed),None
+            return "Fehler beim Eintragen!",None
         except Exception as e:
             return "Fehler: "+str(e),None
 
@@ -855,6 +879,23 @@ def execute_intent(intent_data,user_id,context_data):
     return None,None
 
 def process_calendar(response,data=None):
+    # Handle KALENDER_AUFGABE (tasks) - no collision check, no confirm
+    if "KALENDER_AUFGABE:" in response:
+        tz=pytz.timezone(TIMEZONE)
+        now=datetime.now(tz)
+        task_results=[]
+        clean_lines=[]
+        for line in response.strip().split("\n"):
+            line=line.strip()
+            if line.startswith("KALENDER_AUFGABE:"):
+                title=line.replace("KALENDER_AUFGABE:","").strip()
+                ok=add_allday_event("✅ "+title,now)
+                task_results.append("✅ "+title if ok else "❌ Fehler: "+title)
+            else:
+                clean_lines.append(line)
+        prefix="\n".join(t for t in task_results)
+        rest="\n".join(l for l in clean_lines if l)
+        return (prefix+"\n"+rest).strip() if rest else prefix,None
     if "KALENDER_TERMIN:" not in response:
         return response,None
     results=[]
@@ -920,7 +961,8 @@ async def ask_gpt(user_message,user_id,context_data):
         "Zeit: "+now_str+" Nutzer: "+user_name+"\nTermine:\n"+events+"\nNotizen:\n"+(notes if notes else "Keine")+
         "\nAufgaben:\n"+(todos if todos else "Keine")+get_memory_context()+get_facts_context()+context_summary+childcare_note+
         "\nWICHTIG: Wenn jemand Termine erstellen will, gib JEDEN Termin in einer eigenen Zeile aus. "
-        "Format: KALENDER_TERMIN:Titel|YYYY-MM-DD HH:MM\nKeine anderen Texte wenn Termine erstellt werden!")
+        "Format: KALENDER_TERMIN:Titel|YYYY-MM-DD HH:MM\nKeine anderen Texte wenn Termine erstellt werden!"
+        "\nWICHTIG: Aufgaben/Todos/Teilaufgaben IMMER als KALENDER_AUFGABE:Titel eintragen, NIEMALS als KALENDER_TERMIN mit Uhrzeit!")
     messages=[{"role":"system","content":system}]
     for msg in context_data.get("conversation",[])[-10:]:
         messages.append(msg)
