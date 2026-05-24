@@ -708,26 +708,31 @@ def execute_intent(intent_data,user_id,context_data):
         matches=find_events_by_title(title_hint)
         if not matches:
             return "Keinen Termin gefunden mit '"+title_hint+"'. Schau mal in deinen Kalender?",None
+        # Immer frische Daten laden fuer pending State
+        fresh=load_data()
         if len(matches)==1:
             e=matches[0]
             event_title=e.get("summary","?")
             event_date=e["start"].get("date",e["start"].get("dateTime",""))[:10]
-            # Bestaetigung anfordern
-            data=load_data()
-            data["pending_delete"]={"id":e["id"],"title":event_title,"date":event_date}
-            save_data(data)
-            return "Soll ich '"+event_title+"' am "+event_date+" wirklich loeschen? Antworte mit JA.",None
+            fresh["pending_delete"]={"id":e["id"],"title":event_title,"date":event_date}
+            if "pending_delete_list" in fresh:
+                del fresh["pending_delete_list"]
+            save_data(fresh)
+            return "Soll ich '"+event_title+"' am "+event_date+" loeschen? Antworte mit JA oder NEIN.",None
         else:
-            # Mehrere Treffer -> Liste zeigen
+            # Mehrere Treffer -> Liste zeigen, besten Treffer vorschlagen
             lines=["Mehrere Termine gefunden, welchen meinst du?"]
+            candidates=[]
             for i,e in enumerate(matches[:5],1):
                 t=e.get("summary","?")
                 d=e["start"].get("date",e["start"].get("dateTime",""))[:10]
                 lines.append(str(i)+". "+t+" ("+d+")")
-            lines.append("Antworte mit der Nummer.")
-            data=load_data()
-            data["pending_delete_list"]=[{"id":e["id"],"title":e.get("summary","?"),"date":e["start"].get("date",e["start"].get("dateTime",""))[:10]} for e in matches[:5]]
-            save_data(data)
+                candidates.append({"id":e["id"],"title":t,"date":d})
+            lines.append("Antworte mit der Nummer (z.B. '1').")
+            fresh["pending_delete_list"]=candidates
+            if "pending_delete" in fresh:
+                del fresh["pending_delete"]
+            save_data(fresh)
             return "\n".join(lines),None
 
     return None,None
@@ -1129,28 +1134,46 @@ async def handle_text(update,context):
     if pending_delete:
         txt=text.strip().upper().replace("!","").replace(".","").strip()
         if any(txt==w or txt.startswith(w) for w in JA_WORDS):
-            ok=delete_calendar_event(pending_delete["id"])
-            del data["pending_delete"]
+            try:
+                ok=delete_calendar_event(pending_delete["id"])
+                msg="🗑️ Gelöscht: "+pending_delete["title"] if ok else "Fehler beim Löschen!"
+            except Exception as ex:
+                msg="Fehler beim Löschen: "+str(ex)
+            for key in ["pending_delete","pending_delete_list"]:
+                data.pop(key,None)
             save_data(data)
-            await update.message.reply_text("🗑️ Gelöscht: "+pending_delete["title"] if ok else "Fehler beim Löschen!")
+            await update.message.reply_text(msg)
             return
         elif any(txt==w or txt.startswith(w) for w in NEIN_WORDS):
-            del data["pending_delete"]
+            for key in ["pending_delete","pending_delete_list"]:
+                data.pop(key,None)
             save_data(data)
             await update.message.reply_text("OK, Termin bleibt.")
             return
+        # Wenn weder JA noch NEIN: State behalten, weitermachen
     if pending_delete_list:
+        txt=text.strip().upper().replace("!","").replace(".","").strip()
+        if any(txt==w or txt.startswith(w) for w in NEIN_WORDS):
+            data.pop("pending_delete_list",None)
+            save_data(data)
+            await update.message.reply_text("OK, nichts gelöscht.")
+            return
         nums=re.findall(r"\d+",text)
         if nums:
-            idx=int(nums[0])-1
-            if 0<=idx<len(pending_delete_list):
-                e=pending_delete_list[idx]
-                data["pending_delete"]=e
-                if "pending_delete_list" in data:
-                    del data["pending_delete_list"]
-                save_data(data)
-                await update.message.reply_text("Soll ich '"+e["title"]+"' am "+e["date"]+" wirklich löschen? Antworte mit JA.")
-                return
+            try:
+                idx=int(nums[0])-1
+                if 0<=idx<len(pending_delete_list):
+                    e=pending_delete_list[idx]
+                    data["pending_delete"]=e
+                    data.pop("pending_delete_list",None)
+                    save_data(data)
+                    await update.message.reply_text("Soll ich '"+e["title"]+"' am "+e["date"]+" löschen? Antworte mit JA oder NEIN.")
+                    return
+                else:
+                    await update.message.reply_text("Ungültige Nummer. Bitte 1-"+str(len(pending_delete_list))+" eingeben.")
+                    return
+            except Exception:
+                pass
     if any(kw in text.lower() for kw in BRIEFING_KEYWORDS):
         await generate_briefing(context.bot,target_user_id=user_id)
         return
