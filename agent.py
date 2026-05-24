@@ -150,8 +150,11 @@ def get_upcoming_events(days=7):
     except Exception as e:
         return f"Fehler: {e}"
 
-def find_events_by_title(title_hint,days_ahead=30):
-    """Sucht Kalender-Events anhand eines Titels (fuzzy)."""
+def find_events_by_title(title_hint,days_ahead=60):
+    """Sucht Kalender-Events anhand eines Titels (fuzzy, score-basiert)."""
+    # Stop-Woerter die nicht als Suchbegriff taugen
+    STOP={"der","die","das","den","dem","ein","eine","einen","und","oder","fuer","vom","von","am","an","im","in",
+          "the","a","an","and","or","for","on","at","in","my","our"}
     try:
         service=get_calendar_service()
         if not service:
@@ -159,24 +162,33 @@ def find_events_by_title(title_hint,days_ahead=30):
         tz=pytz.timezone(TIMEZONE)
         now=datetime.now(tz)
         end=(now+timedelta(days=days_ahead)).isoformat()
-        # Auch rueckwirkend 7 Tage suchen (fuer Stornierungen)
-        start=(now-timedelta(days=7)).isoformat()
+        start=(now-timedelta(days=14)).isoformat()  # 2 Wochen rueckwirkend
         result=service.events().list(
             calendarId=CALENDAR_ID,timeMin=start,timeMax=end,
-            maxResults=50,singleEvents=True,orderBy="startTime"
+            maxResults=100,singleEvents=True,orderBy="startTime"
         ).execute()
         events=result.get("items",[])
         hint_low=title_hint.lower()
-        matches=[]
+        # Sinnvolle Suchwoerter (>2 Zeichen, keine Stop-Woerter)
+        hint_words=[w for w in hint_low.split() if len(w)>2 and w not in STOP]
+        scored=[]
         for e in events:
             summary=e.get("summary","").lower()
-            # Fuzzy: alle Woerter des Hints muessen im Titel vorkommen
-            hint_words=[w for w in hint_low.split() if len(w)>2]
-            if hint_words and all(w in summary for w in hint_words):
-                matches.append(e)
-            elif hint_low in summary:
-                matches.append(e)
-        return matches
+            if not hint_words:
+                if hint_low in summary:
+                    scored.append((1,e))
+                continue
+            # Score: Anteil der Hint-Woerter die im Titel vorkommen
+            matches_count=sum(1 for w in hint_words if w in summary)
+            if matches_count>0:
+                score=matches_count/len(hint_words)
+                scored.append((score,e))
+        # Sortiert nach Score absteigend, mindestens 1 Wort muss matchen
+        scored.sort(key=lambda x:-x[0])
+        # Nur Events mit Score >= 0.5 (mind. Haelfte der Woerter)
+        # Oder wenn nur 1 Suchwort: direkt nehmen
+        threshold=0.5 if len(hint_words)>1 else 0.01
+        return [e for score,e in scored if score>=threshold]
     except Exception as e:
         logger.error(f"find_events error: {e}")
         return []
@@ -530,6 +542,11 @@ WICHTIG fuer Reisen/Urlaub/Abwesenheiten:
 - Reisen, Geschaeftsreisen, Urlaub, Abwesenheiten IMMER als create_event mit allday:true
 - Bei mehrtaegigen Ereignissen: date=Startdatum, end_date=letzter Tag (inklusiv), allday:true
 - Keine Zeit angeben wenn allday:true
+
+WICHTIG fuer Verneinungen und Korrekturen:
+- "Heute ist keine Geschaeftsreise", "ich habe keinen Termin", "das ist kein Meeting" -> intent: general (KEIN create_event!)
+- "loesch", "absagen", "cancel", "stornieren", "entfernen", "remove" -> delete_event
+- Verneinungen ("kein", "keine", "not a", "isn't") bei Terminen -> general, NIEMALS create_event
 
 Affects: "self"=nur Schreiber, "partner"=nur Partner, "both"=beide
 
