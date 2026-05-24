@@ -727,7 +727,13 @@ async def ask_gpt_with_tools(user_message,user_id,data):
         +(context_summary+"\n" if context_summary else "")
         +childcare_note+"\n"
         "Nutze die verfügbaren Tools für alle Kalender- und Aufgaben-Aktionen. "
-        "Bei Datumsangaben wie 'heute', 'morgen', 'übermorgen', 'nächsten Montag' – berechne das konkrete Datum selbst."
+        "Bei Datumsangaben wie 'heute', 'morgen', 'übermorgen', 'nächsten Montag' – berechne das konkrete Datum selbst.\n"
+        "WICHTIG Tool-Auswahl:\n"
+        "- Fragen nach Terminen/Kalender ('was steht an', 'liste', 'zeig', 'nächste Woche') → get_events, NIEMALS create_event!\n"
+        "- Neue Termine erstellen → create_event oder create_allday_event\n"
+        "- Aufgaben/Todos → create_task (mit ✅), NIEMALS create_event\n"
+        "- Löschen → delete_event\n"
+        "- Fakten merken ('merke dir', 'speichere', 'ich arbeite nicht an...') → save_fact"
     )
 
     messages=[{"role":"system","content":system}]
