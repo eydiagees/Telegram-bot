@@ -1177,6 +1177,48 @@ async def handle_text(update,context):
     if any(kw in text.lower() for kw in BRIEFING_KEYWORDS):
         await generate_briefing(context.bot,target_user_id=user_id)
         return
+    # ── Direktes Löschen per Keyword (umgeht GPT-Intent) ──
+    DELETE_KEYWORDS=["lösch","loesch","lösche","loeschen","delete","entfern","entfernen","absagen","stornieren","cancel","remove"]
+    txt_low=text.lower()
+    if any(kw in txt_low for kw in DELETE_KEYWORDS) and not data.get("pending_delete"):
+        # Suchbegriff extrahieren: alles nach dem Delete-Keyword
+        title_hint=txt_low
+        for kw in DELETE_KEYWORDS:
+            if kw in title_hint:
+                title_hint=title_hint.split(kw,1)[-1].strip()
+                break
+        # Füllwörter entfernen
+        for fw in ["den","die","das","den termin","die aufgabe","bitte","mal","doch","den eintrag"]:
+            title_hint=title_hint.replace(fw,"").strip()
+        if title_hint:
+            await update.message.chat.send_action("typing")
+            matches=find_events_by_title(title_hint)
+            if not matches:
+                await update.message.reply_text("Keinen Termin gefunden mit '"+title_hint+"'. Gibt es ihn noch im Kalender?")
+                return
+            if len(matches)==1:
+                e=matches[0]
+                event_title=e.get("summary","?")
+                event_date=e["start"].get("date",e["start"].get("dateTime",""))[:10]
+                data["pending_delete"]={"id":e["id"],"title":event_title,"date":event_date}
+                data.pop("pending_delete_list",None)
+                save_data(data)
+                await update.message.reply_text("Soll ich '"+event_title+"' am "+event_date+" löschen? JA oder NEIN.")
+                return
+            else:
+                lines=["Mehrere Termine gefunden:"]
+                candidates=[]
+                for i,e in enumerate(matches[:5],1):
+                    t=e.get("summary","?")
+                    d=e["start"].get("date",e["start"].get("dateTime",""))[:10]
+                    lines.append(str(i)+". "+t+" ("+d+")")
+                    candidates.append({"id":e["id"],"title":t,"date":d})
+                lines.append("Welchen? (Nummer eingeben)")
+                data["pending_delete_list"]=candidates
+                data.pop("pending_delete",None)
+                save_data(data)
+                await update.message.reply_text("\n".join(lines))
+                return
     # ── Checkin-Antwort verarbeiten ──
     checkin_tasks=data.get("checkin_tasks",[])
     if checkin_tasks:
