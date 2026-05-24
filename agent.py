@@ -657,6 +657,12 @@ WICHTIG fuer Verneinungen und Korrekturen:
 - "loesch", "absagen", "cancel", "stornieren", "entfernen", "remove" -> delete_event
 - Verneinungen ("kein", "keine", "not a", "isn't") bei Terminen -> general, NIEMALS create_event
 
+WICHTIG bei mehreren Terminen in einer Nachricht:
+- Mehrere Termine -> intent: general, Bot nutzt KALENDER_TERMIN Format fuer jeden
+- Termine MIT Uhrzeit: KALENDER_TERMIN:Titel|YYYY-MM-DD HH:MM
+- Termine OHNE Uhrzeit (Reisen, Urlaub, Geburtstage): KALENDER_TERMIN:Titel|YYYY-MM-DD (NUR Datum, keine Uhrzeit!)
+- Aufgaben/Todos: KALENDER_AUFGABE:Titel (ganztaegig, kein Datum noetig)
+
 Affects: "self"=nur Schreiber, "partner"=nur Partner, "both"=beide
 
 Format: {"intent":"create_event","title":"...","date":"YYYY-MM-DD","end_date":"YYYY-MM-DD","time":"HH:MM","duration_hours":1,"allday":false,"affects":"self","text":"...","items":[]}"""
@@ -970,8 +976,10 @@ async def ask_gpt(user_message,user_id,context_data):
         "Zeit: "+now_str+" Nutzer: "+user_name+"\nTermine:\n"+events+"\nNotizen:\n"+(notes if notes else "Keine")+
         "\nAufgaben:\n"+(todos if todos else "Keine")+get_memory_context()+get_facts_context()+context_summary+childcare_note+
         "\nWICHTIG: Wenn jemand Termine erstellen will, gib JEDEN Termin in einer eigenen Zeile aus. "
-        "Format: KALENDER_TERMIN:Titel|YYYY-MM-DD HH:MM\nKeine anderen Texte wenn Termine erstellt werden!"
-        "\nWICHTIG: Aufgaben/Todos/Teilaufgaben IMMER als KALENDER_AUFGABE:Titel eintragen, NIEMALS als KALENDER_TERMIN mit Uhrzeit!")
+        "Format MIT Uhrzeit: KALENDER_TERMIN:Titel|YYYY-MM-DD HH:MM"
+        "Format NUR Datum (Reisen/Urlaub/Geburtstage): KALENDER_TERMIN:Titel|YYYY-MM-DD"
+        "Aufgaben/Todos: KALENDER_AUFGABE:Titel"
+        "NIEMALS Reisen/Urlaub mit Uhrzeit eintragen! NIEMALS andere Texte wenn Termine erstellt werden!")
     messages=[{"role":"system","content":system}]
     for msg in context_data.get("conversation",[])[-10:]:
         messages.append(msg)
@@ -1524,28 +1532,101 @@ async def handle_voice(update,context):
             save_data(data)
             await update.message.reply_text("OK, Termin nicht eingetragen.")
             return
+    # ── Pending Delete (Sprache) ──
+    pending_delete=data.get("pending_delete")
+    if pending_delete:
+        txt=text.strip().upper().replace("!","").replace(".","").strip()
+        if any(txt==w or txt.startswith(w) for w in JA_WORDS):
+            try:
+                ok=delete_calendar_event(pending_delete["id"])
+                msg="🗑️ Gelöscht: "+pending_delete["title"] if ok else "Fehler beim Löschen!"
+            except Exception as ex:
+                msg="Fehler: "+str(ex)
+            for key in ["pending_delete","pending_delete_list"]:
+                data.pop(key,None)
+            save_data(data)
+            await update.message.reply_text(msg)
+            return
+        elif any(txt==w or txt.startswith(w) for w in NEIN_WORDS):
+            for key in ["pending_delete","pending_delete_list"]:
+                data.pop(key,None)
+            save_data(data)
+            await update.message.reply_text("OK, Termin bleibt.")
+            return
     if any(kw in text.lower() for kw in BRIEFING_KEYWORDS):
         await generate_briefing(context.bot,target_user_id=user_id)
         return
+    # ── Frustration prüfen ──
+    last_bot_pre=data["conversation"][-1]["content"] if data.get("conversation") else ""
+    FRUSTRATION_TRIGGERS=["hat nicht geklappt","funktioniert nicht","falsch","stimmt nicht",
+        "du verstehst","schon wieder","immer noch","not working","wrong","doesn't work","failed"]
+    if any(t in text.lower() for t in FRUSTRATION_TRIGGERS):
+        detect_user_frustration(text,user_id,last_bot_pre)
+    # ── Direktes Löschen per Keyword (Sprache) ──
+    DELETE_KEYWORDS=["lösch","loesch","lösche","loeschen","delete","entfern","entfernen","absagen","stornieren","cancel","remove"]
+    txt_low=text.lower()
+    if any(kw in txt_low for kw in DELETE_KEYWORDS) and not data.get("pending_delete"):
+        title_hint=txt_low
+        for kw in DELETE_KEYWORDS:
+            if kw in title_hint:
+                title_hint=title_hint.split(kw,1)[-1].strip()
+                break
+        for fw in ["den","die","das","den termin","die aufgabe","bitte","mal","doch"]:
+            title_hint=title_hint.replace(fw,"").strip()
+        if title_hint:
+            matches=find_events_by_title(title_hint)
+            if not matches:
+                await update.message.reply_text("Keinen Termin gefunden mit '"+title_hint+"'.")
+                return
+            if len(matches)==1:
+                e=matches[0]
+                event_title=e.get("summary","?")
+                event_date=e["start"].get("date",e["start"].get("dateTime",""))[:10]
+                data["pending_delete"]={"id":e["id"],"title":event_title,"date":event_date}
+                data.pop("pending_delete_list",None)
+                save_data(data)
+                await update.message.reply_text("Soll ich '"+event_title+"' am "+event_date+" löschen? JA oder NEIN.")
+                return
+            else:
+                lines=["Mehrere Termine gefunden:"]
+                candidates=[]
+                for i,e in enumerate(matches[:5],1):
+                    t=e.get("summary","?")
+                    d=e["start"].get("date",e["start"].get("dateTime",""))[:10]
+                    lines.append(str(i)+". "+t+" ("+d+")")
+                    candidates.append({"id":e["id"],"title":t,"date":d})
+                lines.append("Welchen? (Nummer)")
+                data["pending_delete_list"]=candidates
+                data.pop("pending_delete",None)
+                save_data(data)
+                await update.message.reply_text("\n".join(lines))
+                return
     intent_data=detect_intent(text,user_id,data)
     intent=intent_data.get("intent","general")
     pending=None
-    if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event","query_improvements","add_improvement"]:
-        result=execute_intent(intent_data,user_id,data)
-        if isinstance(result,tuple):
-            response,pending=result
+    try:
+        if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event","query_improvements","add_improvement"]:
+            result=execute_intent(intent_data,user_id,data)
+            if isinstance(result,tuple):
+                response,pending=result
+            else:
+                response=result
+            if response is None:
+                response=await ask_gpt(text,user_id,data)
+                response,pending=process_calendar(response,data)
         else:
-            response=result
-        if response is None:
             response=await ask_gpt(text,user_id,data)
             response,pending=process_calendar(response,data)
-    else:
-        response=await ask_gpt(text,user_id,data)
-        response,pending=process_calendar(response,data)
+    except Exception as ex:
+        log_error_as_improvement(str(ex),f"Voice: {text[:80]} | Intent: {intent}")
+        response="Entschuldigung, da ist etwas schiefgelaufen. Ich habe es notiert."
     if pending:
         data["pending_event"]=pending
     update_memory_from_message(text,user_id,response)
     ctx_change=update_context_from_message(text,user_id,data)
+    saved_fact=detect_and_save_fact(text,user_id,data)
+    if saved_fact:
+        response+="\n\n💾 Gespeichert: "+saved_fact
     data["conversation"].append({"role":"user","content":text})
     data["conversation"].append({"role":"assistant","content":response})
     if len(data["conversation"])>20:
