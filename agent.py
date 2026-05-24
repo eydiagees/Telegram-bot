@@ -1440,19 +1440,18 @@ async def handle_text(update,context):
     if any(t in text.lower() for t in FRUSTRATION_TRIGGERS):
         detect_user_frustration(text,user_id,last_bot_pre)
     # ── Direktes Löschen per Keyword (umgeht GPT-Intent) ──
-    DELETE_KEYWORDS=["lösch","loesch","lösche","loeschen","delete","entfern","entfernen","absagen","stornieren","cancel","remove"]
+    DELETE_KEYWORDS=["loeschen","lösche","lösch","loesch","entfernen","entfern","absagen","stornieren","delete","cancel","remove"]
     txt_low=text.lower()
     if any(kw in txt_low for kw in DELETE_KEYWORDS) and not data.get("pending_delete"):
         # Suchbegriff extrahieren: alles nach dem Delete-Keyword
         title_hint=""
-        matched_kw=""
         for kw in DELETE_KEYWORDS:
-            if kw in txt_low:
+            # Ganzes Wort matchen: kw muss von Wortgrenze umgeben sein
+            import re as _re
+            if _re.search(r"(?<![a-zäöüß])"+_re.escape(kw)+r"(?![a-zäöüß])",txt_low):
                 after=txt_low.split(kw,1)[-1].strip()
                 before=txt_low.split(kw,1)[0].strip()
-                matched_kw=kw
-                # Alles nach dem Keyword nehmen; wenn leer, Wörter davor nehmen
-                title_hint=after if after else before
+                title_hint=after if len(after)>2 else before
                 break
         # Füllwörter entfernen
         STOP=["den","die","das","den termin","die aufgabe","bitte","mal","doch","den eintrag",
@@ -1617,15 +1616,16 @@ async def handle_voice(update,context):
     if any(t in text.lower() for t in FRUSTRATION_TRIGGERS):
         detect_user_frustration(text,user_id,last_bot_pre)
     # ── Direktes Löschen per Keyword (Sprache) ──
-    DELETE_KEYWORDS=["lösch","loesch","lösche","loeschen","delete","entfern","entfernen","absagen","stornieren","cancel","remove"]
+    DELETE_KEYWORDS=["loeschen","lösche","lösch","loesch","entfernen","entfern","absagen","stornieren","delete","cancel","remove"]
     txt_low=text.lower()
     if any(kw in txt_low for kw in DELETE_KEYWORDS) and not data.get("pending_delete"):
         title_hint=""
         for kw in DELETE_KEYWORDS:
-            if kw in txt_low:
+            import re as _re
+            if _re.search(r"(?<![a-zäöüß])"+_re.escape(kw)+r"(?![a-zäöüß])",txt_low):
                 after=txt_low.split(kw,1)[-1].strip()
                 before=txt_low.split(kw,1)[0].strip()
-                title_hint=after if after else before
+                title_hint=after if len(after)>2 else before
                 break
         STOP=["den","die","das","den termin","die aufgabe","bitte","mal","doch",
               "the","please","the appointment","kannst du","can you","bitte"]
