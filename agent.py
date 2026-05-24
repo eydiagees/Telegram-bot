@@ -150,6 +150,49 @@ def get_upcoming_events(days=7):
     except Exception as e:
         return f"Fehler: {e}"
 
+def find_events_by_title(title_hint,days_ahead=30):
+    """Sucht Kalender-Events anhand eines Titels (fuzzy)."""
+    try:
+        service=get_calendar_service()
+        if not service:
+            return []
+        tz=pytz.timezone(TIMEZONE)
+        now=datetime.now(tz)
+        end=(now+timedelta(days=days_ahead)).isoformat()
+        # Auch rueckwirkend 7 Tage suchen (fuer Stornierungen)
+        start=(now-timedelta(days=7)).isoformat()
+        result=service.events().list(
+            calendarId=CALENDAR_ID,timeMin=start,timeMax=end,
+            maxResults=50,singleEvents=True,orderBy="startTime"
+        ).execute()
+        events=result.get("items",[])
+        hint_low=title_hint.lower()
+        matches=[]
+        for e in events:
+            summary=e.get("summary","").lower()
+            # Fuzzy: alle Woerter des Hints muessen im Titel vorkommen
+            hint_words=[w for w in hint_low.split() if len(w)>2]
+            if hint_words and all(w in summary for w in hint_words):
+                matches.append(e)
+            elif hint_low in summary:
+                matches.append(e)
+        return matches
+    except Exception as e:
+        logger.error(f"find_events error: {e}")
+        return []
+
+def delete_calendar_event(event_id):
+    """Loescht ein Kalender-Event anhand der ID."""
+    try:
+        service=get_calendar_service()
+        if not service:
+            return False
+        service.events().delete(calendarId=CALENDAR_ID,eventId=event_id).execute()
+        return True
+    except Exception as e:
+        logger.error(f"delete_event error: {e}")
+        return False
+
 # ── Gedaechtnis ───────────────────────────────────────────────────────────────
 def get_memory_context():
     data=load_data()
@@ -167,6 +210,62 @@ def get_memory_context():
         for key,val in memory["patterns"].items():
             ctx+=f"- {key}: {val}\n"
     return ctx
+
+def save_fact(fact_key,fact_value,data=None):
+    """Speichert ein dauerhaftes Faktum im memory.facts Dictionary."""
+    if data is None:
+        data=load_data()
+    if "memory" not in data:
+        data["memory"]={"persons":{},"patterns":{},"preferences":{},"facts":{}}
+    if "facts" not in data["memory"]:
+        data["memory"]["facts"]={}
+    data["memory"]["facts"][fact_key]=fact_value
+    save_data(data)
+
+def get_facts_context():
+    """Gibt gespeicherte Fakten als Kontext-String zurueck."""
+    data=load_data()
+    facts=data.get("memory",{}).get("facts",{})
+    if not facts:
+        return ""
+    lines=[f"- {k}: {v}" for k,v in facts.items()]
+    return "\nGespeicherte Fakten:\n"+"\n".join(lines)+"\n"
+
+def detect_and_save_fact(user_message,user_id,data=None):
+    """
+    Erkennt wenn jemand sagt 'merke dir X' oder 'X ist Y' als Fakt.
+    Speichert dauerhaft in memory.facts.
+    """
+    if data is None:
+        data=load_data()
+    triggers=["merke dir","remember that","speicher","note that","wichtig:","bitte merken",
+              "ab jetzt","von nun an","from now on","immer wenn","always when"]
+    msg_low=user_message.lower()
+    if not any(t in msg_low for t in triggers):
+        return None
+    tz=pytz.timezone(TIMEZONE)
+    now=datetime.now(tz)
+    extract_prompt="""Extrahiere einen dauerhaften Fakt aus der Nachricht. Gib NUR JSON zurueck oder {}.
+Format: {"key":"kurzer_schluessel","value":"was gespeichert werden soll"}
+Beispiele:
+- "Merke dir: Kita ist Mo-Fr" -> {"key":"kita_oeffnungszeiten","value":"Kita ist nur Montag bis Freitag geoeffnet, am Wochenende geschlossen"}
+- "Marlene hat ab September Schule" -> {"key":"marlene_schule","value":"Marlene geht ab September in die Schule"}
+- "Kate unterrichtet jetzt auch mittwochs" -> {"key":"kate_unterricht","value":"Kate unterrichtet Mittwoch, Donnerstag und Sonntag"}
+Nachricht: """+user_message
+    try:
+        response=client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role":"user","content":extract_prompt}],
+            max_tokens=100,
+            response_format={"type":"json_object"}
+        )
+        extracted=json.loads(response.choices[0].message.content)
+        if extracted and "key" in extracted and "value" in extracted:
+            save_fact(extracted["key"],extracted["value"],data)
+            return extracted["value"]
+        return None
+    except:
+        return None
 
 def update_memory_from_message(user_message,user_id,gpt_response):
     try:
@@ -280,15 +379,19 @@ def get_childcare_situation(data=None):
             kate_teaching=True
             break
 
+    # Kita nur Mo-Fr geoeffnet
+    kita_open=today_wd<=4  # 0=Mo, 4=Fr, 5=Sa, 6=So
+
     result={
         "karsten_away":karsten_away,
         "karsten_status":karsten_status,
         "kate_teaching_today":kate_teaching,
+        "kita_open":kita_open,
         "pickup_person":"kate",  # default
         "conflict":False,
         "conflict_reason":"",
     }
-    if karsten_away:
+    if karsten_away and kita_open:
         result["pickup_person"]="kate"
         if kate_teaching:
             result["conflict"]=True
@@ -318,7 +421,10 @@ def get_context_summary(data=None):
 
     childcare=get_childcare_situation(data)
     if childcare["karsten_away"]:
-        lines.append(f"- Karsten abwesend ({childcare['karsten_status']}) → Kate ist fuer Marlene/Kita zustaendig")
+        if childcare.get("kita_open"):
+            lines.append(f"- Karsten abwesend ({childcare['karsten_status']}) → Kate ist fuer Marlene/Kita zustaendig")
+        else:
+            lines.append(f"- Karsten abwesend ({childcare['karsten_status']}) → Kita heute geschlossen (Wochenende/Feiertag)")
     if childcare["conflict"]:
         lines.append(f"⚠️ KONFLIKT: {childcare['conflict_reason']}")
 
@@ -417,6 +523,7 @@ Intents:
 - complete_task: Aufgabe als erledigt markieren (z.B. "erledigt", "done", "habe X gemacht", "fertig mit X")
 - assign_task: Aufgabe jemandem zuweisen (z.B. "X macht Y", "Y ist fuer Kate", "Karsten uebernimmt Z")
 - query_tasks: Offene Aufgaben anzeigen (z.B. "was steht noch aus", "offene todos", "open tasks")
+- delete_event: Termin oder Aufgabe loeschen/absagen/stornieren (z.B. "loesch den Zahnarzt", "cancel dentist", "Termin X absagen")
 - general: Alles andere
 
 WICHTIG fuer Reisen/Urlaub/Abwesenheiten:
@@ -577,6 +684,35 @@ def execute_intent(intent_data,user_id,context_data):
             return ("📌 "+matched["title"]+" → "+assignee if ok else "Fehler!"),None
         return "Bitte sag mir welche Aufgabe und wer sie übernimmt.",None
 
+    elif intent=="delete_event":
+        title_hint=intent_data.get("title","") or intent_data.get("text","")
+        if not title_hint:
+            return "Welchen Termin soll ich loeschen?",None
+        matches=find_events_by_title(title_hint)
+        if not matches:
+            return "Keinen Termin gefunden mit '"+title_hint+"'. Schau mal in deinen Kalender?",None
+        if len(matches)==1:
+            e=matches[0]
+            event_title=e.get("summary","?")
+            event_date=e["start"].get("date",e["start"].get("dateTime",""))[:10]
+            # Bestaetigung anfordern
+            data=load_data()
+            data["pending_delete"]={"id":e["id"],"title":event_title,"date":event_date}
+            save_data(data)
+            return "Soll ich '"+event_title+"' am "+event_date+" wirklich loeschen? Antworte mit JA.",None
+        else:
+            # Mehrere Treffer -> Liste zeigen
+            lines=["Mehrere Termine gefunden, welchen meinst du?"]
+            for i,e in enumerate(matches[:5],1):
+                t=e.get("summary","?")
+                d=e["start"].get("date",e["start"].get("dateTime",""))[:10]
+                lines.append(str(i)+". "+t+" ("+d+")")
+            lines.append("Antworte mit der Nummer.")
+            data=load_data()
+            data["pending_delete_list"]=[{"id":e["id"],"title":e.get("summary","?"),"date":e["start"].get("date",e["start"].get("dateTime",""))[:10]} for e in matches[:5]]
+            save_data(data)
+            return "\n".join(lines),None
+
     return None,None
 
 def process_calendar(response,data=None):
@@ -643,7 +779,7 @@ async def ask_gpt(user_message,user_id,context_data):
         childcare_note+="\n\u26a0\ufe0f KONFLIKT: "+childcare["conflict_reason"]
     system=("Du bist ein KI-Assistent fuer ein Paar mit ADHS. Antworte in der Sprache des Nutzers. Kurz und klar, max 3-4 Saetze. "
         "Zeit: "+now_str+" Nutzer: "+user_name+"\nTermine:\n"+events+"\nNotizen:\n"+(notes if notes else "Keine")+
-        "\nAufgaben:\n"+(todos if todos else "Keine")+get_memory_context()+context_summary+childcare_note+
+        "\nAufgaben:\n"+(todos if todos else "Keine")+get_memory_context()+get_facts_context()+context_summary+childcare_note+
         "\nWICHTIG: Wenn jemand Termine erstellen will, gib JEDEN Termin in einer eigenen Zeile aus. "
         "Format: KALENDER_TERMIN:Titel|YYYY-MM-DD HH:MM\nKeine anderen Texte wenn Termine erstellt werden!")
     messages=[{"role":"system","content":system}]
@@ -970,6 +1106,34 @@ async def handle_text(update,context):
             save_data(data)
             await update.message.reply_text("OK, Termin nicht eingetragen.")
             return
+    # ── Loeschen bestaetigen ──
+    pending_delete=data.get("pending_delete")
+    pending_delete_list=data.get("pending_delete_list")
+    if pending_delete:
+        txt=text.strip().upper().replace("!","").replace(".","").strip()
+        if any(txt==w or txt.startswith(w) for w in JA_WORDS):
+            ok=delete_calendar_event(pending_delete["id"])
+            del data["pending_delete"]
+            save_data(data)
+            await update.message.reply_text("🗑️ Gelöscht: "+pending_delete["title"] if ok else "Fehler beim Löschen!")
+            return
+        elif any(txt==w or txt.startswith(w) for w in NEIN_WORDS):
+            del data["pending_delete"]
+            save_data(data)
+            await update.message.reply_text("OK, Termin bleibt.")
+            return
+    if pending_delete_list:
+        nums=re.findall(r"\d+",text)
+        if nums:
+            idx=int(nums[0])-1
+            if 0<=idx<len(pending_delete_list):
+                e=pending_delete_list[idx]
+                data["pending_delete"]=e
+                if "pending_delete_list" in data:
+                    del data["pending_delete_list"]
+                save_data(data)
+                await update.message.reply_text("Soll ich '"+e["title"]+"' am "+e["date"]+" wirklich löschen? Antworte mit JA.")
+                return
     if any(kw in text.lower() for kw in BRIEFING_KEYWORDS):
         await generate_briefing(context.bot,target_user_id=user_id)
         return
@@ -1003,7 +1167,7 @@ async def handle_text(update,context):
     intent_data=detect_intent(text,user_id,data)
     intent=intent_data.get("intent","general")
     pending=None
-    if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks"]:
+    if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event"]:
         result=execute_intent(intent_data,user_id,data)
         if isinstance(result,tuple):
             response,pending=result
@@ -1019,6 +1183,9 @@ async def handle_text(update,context):
         data["pending_event"]=pending
     update_memory_from_message(text,user_id,response)
     ctx_change=update_context_from_message(text,user_id,data)
+    saved_fact=detect_and_save_fact(text,user_id,data)
+    if saved_fact:
+        response+="\n\n💾 Gespeichert: "+saved_fact
     data["conversation"].append({"role":"user","content":text})
     data["conversation"].append({"role":"assistant","content":response})
     if len(data["conversation"])>20:
@@ -1065,7 +1232,7 @@ async def handle_voice(update,context):
     intent_data=detect_intent(text,user_id,data)
     intent=intent_data.get("intent","general")
     pending=None
-    if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks"]:
+    if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event"]:
         result=execute_intent(intent_data,user_id,data)
         if isinstance(result,tuple):
             response,pending=result
