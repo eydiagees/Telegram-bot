@@ -765,6 +765,8 @@ async def ask_gpt_with_tools(user_message,user_id,data):
             tool_args=json.loads(tc.function.arguments)
         except:
             tool_args={}
+        # Reload data before each tool to pick up state changes from previous tools
+        data=load_data()
         result=execute_tool(tool_name,tool_args,user_id,data)
         tool_results.append(result)
         messages.append({
@@ -772,6 +774,8 @@ async def ask_gpt_with_tools(user_message,user_id,data):
             "tool_call_id":tc.id,
             "content":result
         })
+    # Final reload so handle_message sees latest state
+    data=load_data()
 
     # Second GPT call to formulate final response
     response2=client.chat.completions.create(
