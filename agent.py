@@ -354,16 +354,14 @@ def get_childcare_situation(data=None):
     kate_teaching=False
     karsten_status=""
 
-    # Pruefen ob Karsten abwesend (Reise, Urlaub, etc.)
+    # Pruefen ob Karsten abwesend – mit automatischem Reset wenn until-Datum vorbei
     k_ctx=current.get("karsten",{})
     if k_ctx:
         status=k_ctx.get("status","")
         until=k_ctx.get("until","")
         if status in ["geschaeftsreise","reise","urlaub","abwesend","dienstreise"]:
-            # Pruefen ob 'until' noch in der Zukunft liegt
             if until:
                 try:
-                    # until kann "03.06" oder "2026-06-03" sein
                     if len(until)==5:  # "03.06"
                         d,m=until.split(".")
                         until_dt=tz.localize(datetime(now.year,int(m),int(d)))
@@ -371,7 +369,12 @@ def get_childcare_situation(data=None):
                         until_dt=tz.localize(datetime.fromisoformat(until))
                     else:
                         until_dt=now+timedelta(days=1)
-                    if now<=until_dt+timedelta(days=1):
+                    # Abgelaufen? Kontext automatisch zuruecksetzen
+                    if now>until_dt+timedelta(days=1):
+                        ctx["current"]["karsten"]={}
+                        save_context(ctx,data)
+                        logger.info("Kontext Karsten automatisch zurueckgesetzt (Reise abgelaufen)")
+                    else:
                         karsten_away=True
                         karsten_status=status
                 except:
@@ -645,12 +648,22 @@ Intents:
 - delete_event: Termin oder Aufgabe loeschen/absagen/stornieren (z.B. "loesch den Zahnarzt", "cancel dentist", "Termin X absagen")
 - query_improvements: Verbesserungsliste anzeigen (z.B. "zeig Verbesserungen", "show improvements", "offene Bugs")
 - add_improvement: Verbesserung manuell eintragen (z.B. "notiere: X klappt nicht", "merke dir als Bug: X", "add to improvements: X")
+- adhd_emergency: Notfallmodus bei Ueberforderung (z.B. "ich komme nicht in die Gaenge", "ich weiss nicht wo anfangen", "overwhelmed", "zu viel", "ich schaffe das nicht", "can't get started", "I don't know where to begin")
 - general: Alles andere
 
 WICHTIG fuer Reisen/Urlaub/Abwesenheiten:
 - Reisen, Geschaeftsreisen, Urlaub, Abwesenheiten IMMER als create_event mit allday:true
 - Bei mehrtaegigen Ereignissen: date=Startdatum, end_date=letzter Tag (inklusiv), allday:true
 - Keine Zeit angeben wenn allday:true
+
+WICHTIG fuer Datumsberechnung – nutze die angegebene aktuelle Zeit:
+- "heute" -> aktuelles Datum aus "Zeit:" Feld
+- "morgen" -> aktuelles Datum + 1 Tag
+- "uebermorgen" -> aktuelles Datum + 2 Tage
+- "naechsten Montag/Dienstag/..." -> naechster entsprechender Wochentag
+- "naechste Woche" -> aktuelles Datum + 7 Tage
+- "in zwei Wochen" -> aktuelles Datum + 14 Tage
+- IMMER konkretes YYYY-MM-DD berechnen und ausgeben, NIE relative Begriffe im date-Feld
 
 WICHTIG fuer Verneinungen und Korrekturen:
 - "Heute ist keine Geschaeftsreise", "ich habe keinen Termin", "das ist kein Meeting" -> intent: general (KEIN create_event!)
@@ -730,21 +743,20 @@ def execute_intent(intent_data,user_id,context_data):
             return "Fehler: "+str(e),None
 
     elif intent=="create_task":
-        # Unterstützt einzelne Aufgabe (text/title) und mehrere (items-Liste)
         deadline=intent_data.get("date")
+        lang=USERS.get(user_id,{}).get("lang","de")
         try:
             if deadline:
                 d=date.fromisoformat(deadline)
                 dt=datetime(d.year,d.month,d.day)
             else:
                 dt=now
-            # Bulk: items-Liste vorhanden?
             items=intent_data.get("items",[])
             if not items:
-                single=intent_data.get("text") or intent_data.get("title","Aufgabe")
+                single=intent_data.get("text") or intent_data.get("title",("Aufgabe" if lang=="de" else "Task"))
                 items=[single] if single else []
             if not items:
-                return "Was soll ich als Aufgabe eintragen?",None
+                return ("Was soll ich als Aufgabe eintragen?" if lang=="de" else "What task should I add?"),None
             saved=[]
             failed=[]
             for task_text in items:
@@ -758,12 +770,13 @@ def execute_intent(intent_data,user_id,context_data):
                     failed.append(task_text)
             if saved and not failed:
                 if len(saved)==1:
-                    return "Aufgabe eingetragen: ✅ "+saved[0],None
+                    return ("Aufgabe eingetragen: ✅ " if lang=="de" else "Task added: ✅ ")+saved[0],None
                 else:
-                    return "✅ "+str(len(saved))+" Aufgaben eingetragen:\n"+"\n".join("• "+t for t in saved),None
+                    label="✅ "+str(len(saved))+(" Aufgaben eingetragen:\n" if lang=="de" else " tasks added:\n")
+                    return label+"\n".join("• "+t for t in saved),None
             elif saved and failed:
-                return "✅ Eingetragen: "+", ".join(saved)+"\n❌ Fehler bei: "+", ".join(failed),None
-            return "Fehler beim Eintragen!",None
+                return "✅ "+", ".join(saved)+"\n❌ "+("Fehler bei: " if lang=="de" else "Failed: ")+", ".join(failed),None
+            return ("Fehler beim Eintragen!" if lang=="de" else "Error adding tasks!"),None
         except Exception as e:
             return "Fehler: "+str(e),None
 
@@ -793,15 +806,17 @@ def execute_intent(intent_data,user_id,context_data):
         return label+":\n"+get_upcoming_events(days),None
 
     elif intent=="query_tasks":
+        lang=USERS.get(user_id,{}).get("lang","de")
         tasks=get_open_tasks(days_back=30)
         if not tasks:
-            return ("Keine offenen Aufgaben! 🎉" if "de"==USERS.get(user_id,{}).get("lang") else "No open tasks! 🎉"),None
+            return ("Keine offenen Aufgaben! 🎉" if lang=="de" else "No open tasks! 🎉"),None
         lines=[]
         for i,t in enumerate(tasks,1):
             assignee=" → "+t["assignee"] if t["assignee"] else ""
             overdue=" ⚠️" if t["date"]<now.strftime("%Y-%m-%d") else ""
             lines.append(str(i)+". "+t["title"]+assignee+overdue)
-        return "\n".join(lines),None
+        header=("Offene Aufgaben:" if lang=="de" else "Open tasks:")
+        return header+"\n"+"\n".join(lines),None
 
     elif intent=="complete_task":
         title_hint=intent_data.get("title","") or intent_data.get("text","")
@@ -891,9 +906,39 @@ def execute_intent(intent_data,user_id,context_data):
             return "📝 Notiert: "+description,None
         return "Was soll ich notieren?",None
 
-    return None,None
+    elif intent=="adhd_emergency":
+        lang=USERS.get(user_id,{}).get("lang","de")
+        user_name=USER_NAMES.get(user_id,"")
+        tasks=get_open_tasks(days_back=60)
+        tz_local=pytz.timezone(TIMEZONE)
+        today=datetime.now(tz_local).strftime("%Y-%m-%d")
+        overdue=[t for t in tasks if t["date"]<today]
+        upcoming=[t for t in tasks if t["date"]>=today]
+        priority=overdue[:3] if overdue else (upcoming[:3] if upcoming else tasks[:3])
+        task_list="\n".join("- "+t["title"] for t in priority) if priority else ""
+        try:
+            if lang=="de":
+                prompt=("Du bist ein ADHS-Coach. "+user_name+" fuehlt sich ueberfordert. "
+                    "Antworte kurz (max 4 Zeilen), ruhig und motivierend auf Deutsch.\n"
+                    +("Offene Aufgaben:\n"+task_list if task_list else "Keine Aufgaben offen.")+"\n"
+                    "Nenne EINE kleinste konkrete naechste Handlung.")
+            else:
+                prompt=("You are an ADHD coach. "+user_name+" feels overwhelmed. "
+                    "Reply briefly (max 4 lines), calm and motivating in English.\n"
+                    +("Open tasks:\n"+task_list if task_list else "No open tasks.")+"\n"
+                    "Name ONE smallest concrete next action.")
+            resp=client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role":"user","content":prompt}],
+                max_tokens=150
+            )
+            return resp.choices[0].message.content.strip(),None
+        except:
+            if lang=="de":
+                return ("Erstmal durchatmen.\nFang hier an: "+priority[0]["title"] if priority else "Erstmal durchatmen. Du schaffst das."),None
+            else:
+                return ("Take a breath.\nStart here: "+priority[0]["title"] if priority else "Take a breath. You've got this."),None
 
-def process_calendar(response,data=None):
     # Handle KALENDER_AUFGABE (tasks) - no collision check, no confirm
     if "KALENDER_AUFGABE:" in response:
         tz=pytz.timezone(TIMEZONE)
@@ -1467,7 +1512,7 @@ async def handle_text(update,context):
     intent=intent_data.get("intent","general")
     pending=None
     try:
-        if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event","query_improvements","add_improvement","query_improvements"]:
+        if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event","query_improvements","add_improvement","adhd_emergency","adhd_emergency"]:
             result=execute_intent(intent_data,user_id,data)
             if isinstance(result,tuple):
                 response,pending=result
@@ -1605,7 +1650,7 @@ async def handle_voice(update,context):
     intent=intent_data.get("intent","general")
     pending=None
     try:
-        if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event","query_improvements","add_improvement"]:
+        if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event","query_improvements","add_improvement","adhd_emergency"]:
             result=execute_intent(intent_data,user_id,data)
             if isinstance(result,tuple):
                 response,pending=result
