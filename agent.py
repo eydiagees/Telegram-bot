@@ -522,6 +522,113 @@ async def notify_partner_if_needed(bot,user_id,context_change_msg,data=None):
     except Exception as e:
         logger.error(f"Partner notify error: {e}")
 
+
+# ── Self-Improvement System ──────────────────────────────────────────────────
+IMPROVEMENTS_FILE="improvements.json"
+FEEDBACK_TRIGGERS_DE=["das hat nicht geklappt","falsch","stimmt nicht","du verstehst","funktioniert nicht",
+    "das ist falsch","wieder falsch","schon wieder","immer noch","kapierst du nicht","verstehst du nicht",
+    "das war falsch","nicht richtig","klappt nicht","geht nicht"]
+FEEDBACK_TRIGGERS_EN=["that's wrong","not working","you don't understand","still broken","wrong again",
+    "doesn't work","that was wrong","not right","failed again","you keep","still not"]
+
+def load_improvements():
+    if os.path.exists(IMPROVEMENTS_FILE):
+        with open(IMPROVEMENTS_FILE,"r",encoding="utf-8") as f:
+            return json.load(f)
+    return {"improvements":[]}
+
+def save_improvements(data):
+    with open(IMPROVEMENTS_FILE,"w",encoding="utf-8") as f:
+        json.dump(data,f,ensure_ascii=False,indent=2)
+
+def add_improvement(description,source="error",context="",status="open"):
+    """Fügt einen Verbesserungsvorschlag hinzu. Verhindert Duplikate."""
+    tz=pytz.timezone(TIMEZONE)
+    now=datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+    data=load_improvements()
+    # Duplikat-Check: ähnliche Einträge nicht doppelt speichern
+    desc_low=description.lower()
+    for item in data["improvements"]:
+        if item.get("status")=="open" and desc_low[:50] in item.get("description","").lower():
+            return  # schon vorhanden
+    data["improvements"].append({
+        "id":len(data["improvements"])+1,
+        "date":now,
+        "source":source,
+        "description":description,
+        "context":context,
+        "status":"open"
+    })
+    save_improvements(data)
+    logger.info(f"Improvement logged: {description[:60]}")
+
+def log_error_as_improvement(error_msg,context_msg=""):
+    """Wenn ein Fehler auftritt, GPT formuliert daraus einen Verbesserungsvorschlag."""
+    try:
+        prompt=("Ein Telegram-Bot hat folgenden Fehler gehabt. Formuliere in einem Satz was verbessert werden sollte.\n"
+            "Fehler: "+error_msg+"\nKontext: "+context_msg+"\n"
+            "Antworte NUR mit dem Verbesserungsvorschlag, max 100 Zeichen.")
+        response=client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role":"user","content":prompt}],
+            max_tokens=80
+        )
+        suggestion=response.choices[0].message.content.strip()
+        add_improvement(suggestion,source="error",context=context_msg)
+    except:
+        add_improvement("Fehler: "+error_msg[:100],source="error",context=context_msg)
+
+def detect_user_frustration(user_message,user_id,last_bot_response=""):
+    """Erkennt wenn User frustriert ist und extrahiert was schiefging."""
+    msg_low=user_message.lower()
+    lang=USERS.get(user_id,{}).get("lang","de")
+    triggers=FEEDBACK_TRIGGERS_DE if lang=="de" else FEEDBACK_TRIGGERS_EN
+    if not any(t in msg_low for t in triggers):
+        return
+    try:
+        prompt=("Ein Nutzer ist unzufrieden mit einem Telegram-Assistenten. "
+            "Formuliere in einem Satz was der Bot verbessern sollte.\n"
+            "Nutzer sagte: \'"+user_message+"\'\n"
+            "Bot hatte vorher geantwortet: \'"+last_bot_response[:200]+"\'\n"
+            "Antworte NUR mit dem Verbesserungsvorschlag auf Deutsch, max 120 Zeichen.")
+        response=client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role":"user","content":prompt}],
+            max_tokens=80
+        )
+        suggestion=response.choices[0].message.content.strip()
+        user_name=USER_NAMES.get(user_id,"?")
+        add_improvement(suggestion,source="user_feedback",
+            context=f"{user_name}: \"{user_message[:80]}\"")
+    except:
+        pass
+
+def get_improvements_summary(status_filter=None):
+    """Gibt eine formatierte Liste der Verbesserungsvorschläge zurück."""
+    data=load_improvements()
+    items=data.get("improvements",[])
+    if status_filter:
+        items=[i for i in items if i.get("status")==status_filter]
+    if not items:
+        return "Keine Einträge."
+    lines=[]
+    for i in items:
+        icon={"open":"🔴","in_progress":"🟡","fixed":"✅"}.get(i.get("status","open"),"⚪")
+        lines.append(f"{icon} #{i['id']} [{i['date'][:10]}] ({i['source']})\n   {i['description']}")
+    return "\n\n".join(lines)
+
+def mark_improvement_fixed(item_id):
+    """Markiert einen Verbesserungsvorschlag als erledigt."""
+    data=load_improvements()
+    for item in data["improvements"]:
+        if item.get("id")==item_id:
+            item["status"]="fixed"
+            tz=pytz.timezone(TIMEZONE)
+            item["fixed_date"]=datetime.now(tz).strftime("%Y-%m-%d")
+            save_improvements(data)
+            return True
+    return False
+
 # ── Intent Engine ─────────────────────────────────────────────────────────────
 INTENT_SYSTEM="""Du bist ein Intent-Erkennungs-System. Analysiere die Nachricht und gib NUR JSON zurueck.
 Karsten (ID: 281391093) spricht Deutsch. Kate (ID: 934428072) spricht Englisch.
@@ -536,6 +643,7 @@ Intents:
 - assign_task: Aufgabe jemandem zuweisen (z.B. "X macht Y", "Y ist fuer Kate", "Karsten uebernimmt Z")
 - query_tasks: Offene Aufgaben anzeigen (z.B. "was steht noch aus", "offene todos", "open tasks")
 - delete_event: Termin oder Aufgabe loeschen/absagen/stornieren (z.B. "loesch den Zahnarzt", "cancel dentist", "Termin X absagen")
+- query_improvements: Verbesserungsliste anzeigen (z.B. "zeig Verbesserungen", "was hat nicht geklappt", "show improvements", "offene Bugs")
 - general: Alles andere
 
 WICHTIG fuer Reisen/Urlaub/Abwesenheiten:
@@ -734,6 +842,15 @@ def execute_intent(intent_data,user_id,context_data):
                 del fresh["pending_delete"]
             save_data(fresh)
             return "\n".join(lines),None
+
+    elif intent=="query_improvements":
+        text_low=intent_data.get("text","").lower()
+        if any(w in text_low for w in ["fix","erledigt","done","closed"]):
+            result=get_improvements_summary(status_filter="fixed")
+            return "✅ Erledigte Verbesserungen:\n\n"+result,None
+        result=get_improvements_summary(status_filter="open")
+        total=len(load_improvements().get("improvements",[]))
+        return f"🔴 Offene Verbesserungen ({total} gesamt):\n\n"+result,None
 
     return None,None
 
@@ -1283,18 +1400,22 @@ async def handle_text(update,context):
     intent_data=detect_intent(text,user_id,data)
     intent=intent_data.get("intent","general")
     pending=None
-    if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event"]:
-        result=execute_intent(intent_data,user_id,data)
-        if isinstance(result,tuple):
-            response,pending=result
+    try:
+        if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event","query_improvements","query_improvements"]:
+            result=execute_intent(intent_data,user_id,data)
+            if isinstance(result,tuple):
+                response,pending=result
+            else:
+                response=result
+            if response is None:
+                response=await ask_gpt(text,user_id,data)
+                response,pending=process_calendar(response,data)
         else:
-            response=result
-        if response is None:
             response=await ask_gpt(text,user_id,data)
             response,pending=process_calendar(response,data)
-    else:
-        response=await ask_gpt(text,user_id,data)
-        response,pending=process_calendar(response,data)
+    except Exception as ex:
+        log_error_as_improvement(str(ex),f"User: {text[:80]} | Intent: {intent}")
+        response="Entschuldigung, da ist etwas schiefgelaufen. Ich habe es notiert."
     if pending:
         data["pending_event"]=pending
     update_memory_from_message(text,user_id,response)
@@ -1302,6 +1423,9 @@ async def handle_text(update,context):
     saved_fact=detect_and_save_fact(text,user_id,data)
     if saved_fact:
         response+="\n\n💾 Gespeichert: "+saved_fact
+    # Frustrations-Erkennung: User unzufrieden?
+    last_bot=data["conversation"][-1]["content"] if data.get("conversation") else ""
+    detect_user_frustration(text,user_id,last_bot)
     data["conversation"].append({"role":"user","content":text})
     data["conversation"].append({"role":"assistant","content":response})
     if len(data["conversation"])>20:
@@ -1348,7 +1472,7 @@ async def handle_voice(update,context):
     intent_data=detect_intent(text,user_id,data)
     intent=intent_data.get("intent","general")
     pending=None
-    if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event"]:
+    if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event","query_improvements"]:
         result=execute_intent(intent_data,user_id,data)
         if isinstance(result,tuple):
             response,pending=result
