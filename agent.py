@@ -643,7 +643,8 @@ Intents:
 - assign_task: Aufgabe jemandem zuweisen (z.B. "X macht Y", "Y ist fuer Kate", "Karsten uebernimmt Z")
 - query_tasks: Offene Aufgaben anzeigen (z.B. "was steht noch aus", "offene todos", "open tasks")
 - delete_event: Termin oder Aufgabe loeschen/absagen/stornieren (z.B. "loesch den Zahnarzt", "cancel dentist", "Termin X absagen")
-- query_improvements: Verbesserungsliste anzeigen (z.B. "zeig Verbesserungen", "was hat nicht geklappt", "show improvements", "offene Bugs")
+- query_improvements: Verbesserungsliste anzeigen (z.B. "zeig Verbesserungen", "show improvements", "offene Bugs")
+- add_improvement: Verbesserung manuell eintragen (z.B. "notiere: X klappt nicht", "merke dir als Bug: X", "add to improvements: X")
 - general: Alles andere
 
 WICHTIG fuer Reisen/Urlaub/Abwesenheiten:
@@ -874,7 +875,15 @@ def execute_intent(intent_data,user_id,context_data):
             return "✅ Erledigte Verbesserungen:\n\n"+result,None
         result=get_improvements_summary(status_filter="open")
         total=len(load_improvements().get("improvements",[]))
-        return f"🔴 Offene Verbesserungen ({total} gesamt):\n\n"+result,None
+        return "🔴 Offene Verbesserungen ("+str(total)+" gesamt):\n\n"+result,None
+
+    elif intent=="add_improvement":
+        description=intent_data.get("text","") or intent_data.get("title","")
+        user_name=USER_NAMES.get(user_id,"?")
+        if description:
+            add_improvement(description,source="user_manual",context=user_name+": manuell eingetragen")
+            return "📝 Notiert: "+description,None
+        return "Was soll ich notieren?",None
 
     return None,None
 
@@ -1370,6 +1379,13 @@ async def handle_text(update,context):
     if any(kw in text.lower() for kw in BRIEFING_KEYWORDS):
         await generate_briefing(context.bot,target_user_id=user_id)
         return
+    # ── Frustration zuerst prüfen (vor Intent-Erkennung) ──
+    last_bot_pre=data["conversation"][-1]["content"] if data.get("conversation") else ""
+    FRUSTRATION_TRIGGERS=["hat nicht geklappt","funktioniert nicht","falsch","stimmt nicht",
+        "du verstehst","schon wieder","immer noch","kapierst","not working","wrong","doesn't work",
+        "still broken","failed","that was wrong","nicht richtig","klappt nicht"]
+    if any(t in text.lower() for t in FRUSTRATION_TRIGGERS):
+        detect_user_frustration(text,user_id,last_bot_pre)
     # ── Direktes Löschen per Keyword (umgeht GPT-Intent) ──
     DELETE_KEYWORDS=["lösch","loesch","lösche","loeschen","delete","entfern","entfernen","absagen","stornieren","cancel","remove"]
     txt_low=text.lower()
@@ -1443,7 +1459,7 @@ async def handle_text(update,context):
     intent=intent_data.get("intent","general")
     pending=None
     try:
-        if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event","query_improvements","query_improvements"]:
+        if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event","query_improvements","add_improvement","query_improvements"]:
             result=execute_intent(intent_data,user_id,data)
             if isinstance(result,tuple):
                 response,pending=result
@@ -1514,7 +1530,7 @@ async def handle_voice(update,context):
     intent_data=detect_intent(text,user_id,data)
     intent=intent_data.get("intent","general")
     pending=None
-    if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event","query_improvements"]:
+    if intent in ["create_event","create_task","create_list","create_note","query_events","complete_task","assign_task","query_tasks","delete_event","query_improvements","add_improvement"]:
         result=execute_intent(intent_data,user_id,data)
         if isinstance(result,tuple):
             response,pending=result
